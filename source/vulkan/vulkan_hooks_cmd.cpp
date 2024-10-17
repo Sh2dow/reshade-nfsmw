@@ -3,13 +3,15 @@
  * SPDX-License-Identifier: BSD-3-Clause OR MIT
  */
 
-#include "dll_log.hpp"
-#include "lockfree_linear_map.hpp"
 #include "vulkan_hooks.hpp"
 #include "vulkan_impl_device.hpp"
 #include "vulkan_impl_command_list.hpp"
 #include "vulkan_impl_type_convert.hpp"
-#include <algorithm>
+#include "dll_log.hpp"
+#include "addon_manager.hpp"
+#include "lockfree_linear_map.hpp"
+#include <cstring> // std::memcpy, std::memset
+#include <algorithm> // std::copy_n, std::max, std::min, std::swap
 
 extern lockfree_linear_map<void *, reshade::vulkan::device_impl *, 8> g_vulkan_devices;
 
@@ -22,26 +24,39 @@ extern lockfree_linear_map<void *, reshade::vulkan::device_impl *, 8> g_vulkan_d
 static void invoke_begin_render_pass_event(const reshade::vulkan::device_impl *device_impl, reshade::vulkan::object_data<VK_OBJECT_TYPE_COMMAND_BUFFER> *cmd_impl, const VkRenderPassBeginInfo *begin_info)
 {
 	const auto render_pass_data = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_RENDER_PASS>(cmd_impl->current_render_pass);
-	const auto framebuffer_data = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_FRAMEBUFFER>(cmd_impl->current_framebuffer);
-
 	const reshade::vulkan::object_data<VK_OBJECT_TYPE_RENDER_PASS>::subpass &subpass = render_pass_data->subpasses[cmd_impl->current_subpass];
 
+	const VkImageView *attachments = nullptr;
+
+	// Attachments may optionally be provided directly, rather than through the framebuffer object, when VK_KHR_imageless_framebuffer is used
+	if (const auto attachment_begin_info = find_in_structure_chain<VkRenderPassAttachmentBeginInfo>(begin_info, VK_STRUCTURE_TYPE_RENDER_PASS_ATTACHMENT_BEGIN_INFO))
+	{
+		attachments = attachment_begin_info->pAttachments;
+		assert(subpass.num_color_attachments <= attachment_begin_info->attachmentCount);
+	}
+	else
+	{
+		const auto framebuffer_data = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_FRAMEBUFFER>(cmd_impl->current_framebuffer);
+		attachments = framebuffer_data->attachments.data();
+	}
+
+	// Update current attachments on the command list
 	for (uint32_t i = 0; i < subpass.num_color_attachments; ++i)
 	{
 		const uint32_t a = subpass.color_attachments[i];
-		cmd_impl->current_color_attachments[i] = (a != VK_ATTACHMENT_UNUSED) ? framebuffer_data->attachments[a] : VK_NULL_HANDLE;
+		cmd_impl->current_color_attachments[i] = (a != VK_ATTACHMENT_UNUSED) ? attachments[a] : VK_NULL_HANDLE;
 	}
 
 	{
 		const uint32_t a = subpass.depth_stencil_attachment;
-		cmd_impl->current_depth_stencil_attachment = (a != VK_ATTACHMENT_UNUSED) ? framebuffer_data->attachments[a] : VK_NULL_HANDLE;
+		cmd_impl->current_depth_stencil_attachment = (a != VK_ATTACHMENT_UNUSED) ? attachments[a] : VK_NULL_HANDLE;
 	}
 
 	if (!reshade::has_addon_event<reshade::addon_event::begin_render_pass>())
 		return;
 
 	uint32_t num_transitions = 0;
-	temp_mem<VkImageMemoryBarrier, 9> transitions(subpass.num_color_attachments + 1);
+	temp_mem<VkImageMemoryBarrier, 8 + 1> transitions(subpass.num_color_attachments + 1);
 
 	temp_mem<reshade::api::render_pass_render_target_desc, 8> rts(subpass.num_color_attachments);
 	for (uint32_t i = 0; i < subpass.num_color_attachments; ++i)
@@ -53,7 +68,7 @@ static void invoke_begin_render_pass_event(const reshade::vulkan::device_impl *d
 		{
 			const VkAttachmentDescription &desc = render_pass_data->attachments[a];
 
-			rt.view = { (uint64_t)framebuffer_data->attachments[a] };
+			rt.view = { (uint64_t)attachments[a] };
 			rt.load_op = reshade::vulkan::convert_render_pass_load_op(desc.loadOp);
 			rt.store_op = reshade::vulkan::convert_render_pass_store_op(desc.storeOp);
 			std::memset(rt.clear_color, 0, sizeof(rt.clear_color));
@@ -92,7 +107,7 @@ static void invoke_begin_render_pass_event(const reshade::vulkan::device_impl *d
 		{
 			const VkAttachmentDescription &desc = render_pass_data->attachments[a];
 
-			ds.view = { (uint64_t)framebuffer_data->attachments[a] };
+			ds.view = { (uint64_t)attachments[a] };
 			ds.depth_load_op = reshade::vulkan::convert_render_pass_load_op(desc.loadOp);
 			ds.depth_store_op = reshade::vulkan::convert_render_pass_store_op(desc.storeOp);
 			ds.stencil_load_op = reshade::vulkan::convert_render_pass_load_op(desc.stencilLoadOp);
@@ -139,9 +154,9 @@ static void invoke_begin_render_pass_event(const reshade::vulkan::device_impl *d
 
 	reshade::invoke_addon_event<reshade::addon_event::begin_render_pass>(cmd_impl, subpass.num_color_attachments, rts.p, subpass.depth_stencil_attachment != VK_ATTACHMENT_UNUSED ? &ds : nullptr);
 
+	// Revert back to previous state
 	for (uint32_t i = 0; i < num_transitions; ++i)
 		std::swap(transitions[i].oldLayout, transitions[i].newLayout);
-
 	if (num_transitions != 0)
 		device_impl->_dispatch_table.CmdPipelineBarrier(cmd_impl->_orig, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, num_transitions, transitions.p);
 }
@@ -150,6 +165,7 @@ static void invoke_begin_render_pass_event(reshade::vulkan::object_data<VK_OBJEC
 	assert(rendering_info != nullptr);
 	assert(rendering_info->colorAttachmentCount <= 8);
 
+	// Update current attachments on the command list
 	for (uint32_t i = 0; i < rendering_info->colorAttachmentCount && i < 8; ++i)
 		cmd_impl->current_color_attachments[i] = rendering_info->pColorAttachments[i].imageView;
 
@@ -203,8 +219,8 @@ static void invoke_begin_render_pass_event(reshade::vulkan::object_data<VK_OBJEC
 }
 #endif
 
-#if RESHADE_ADDON && !RESHADE_ADDON_LITE
-static inline uint32_t calc_subresource_index(reshade::vulkan::device_impl *device, VkImage image, const VkImageSubresourceLayers &layers)
+#if RESHADE_ADDON >= 2
+static uint32_t calc_subresource_index(reshade::vulkan::device_impl *device, VkImage image, const VkImageSubresourceLayers &layers)
 {
 	const uint32_t levels = device->get_private_data_for_object<VK_OBJECT_TYPE_IMAGE>(image)->create_info.mipLevels;
 	return layers.mipLevel + layers.baseArrayLayer * levels;
@@ -232,6 +248,8 @@ VkResult VKAPI_CALL vkBeginCommandBuffer(VkCommandBuffer commandBuffer, const Vk
 			cmd_impl->current_subpass = inheritance_info.subpass;
 			cmd_impl->current_render_pass = inheritance_info.renderPass;
 
+			cmd_impl->_is_in_render_pass = true;
+
 			if (inheritance_info.framebuffer != VK_NULL_HANDLE)
 			{
 				cmd_impl->current_framebuffer = inheritance_info.framebuffer;
@@ -252,7 +270,7 @@ VkResult VKAPI_CALL vkBeginCommandBuffer(VkCommandBuffer commandBuffer, const Vk
 #if RESHADE_VERBOSE_LOG
 	if (result < VK_SUCCESS)
 	{
-		LOG(WARN) << "vkBeginCommandBuffer" << " failed with error code " << result << '.';
+		reshade::log::message(reshade::log::level::warning, "vkBeginCommandBuffer failed with error code %d.", static_cast<int>(result));
 	}
 #endif
 	return result;
@@ -271,6 +289,8 @@ VkResult VKAPI_CALL vkEndCommandBuffer(VkCommandBuffer commandBuffer)
 		cmd_impl->current_subpass = std::numeric_limits<uint32_t>::max();
 		cmd_impl->current_render_pass = VK_NULL_HANDLE;
 		cmd_impl->current_framebuffer = VK_NULL_HANDLE;
+
+		cmd_impl->_is_in_render_pass = false;
 	}
 
 	reshade::invoke_addon_event<reshade::addon_event::close_command_list>(cmd_impl);
@@ -281,7 +301,7 @@ VkResult VKAPI_CALL vkEndCommandBuffer(VkCommandBuffer commandBuffer)
 #if RESHADE_VERBOSE_LOG
 	if (result < VK_SUCCESS)
 	{
-		LOG(WARN) << "vkEndCommandBuffer" << " failed with error code " << result << '.';
+		reshade::log::message(reshade::log::level::warning, "vkEndCommandBuffer failed with error code %d.", static_cast<int>(result));
 	}
 #endif
 	return result;
@@ -294,7 +314,7 @@ void VKAPI_CALL vkCmdBindPipeline(VkCommandBuffer commandBuffer, VkPipelineBindP
 	GET_DISPATCH_PTR_FROM(CmdBindPipeline, device_impl);
 	trampoline(commandBuffer, pipelineBindPoint, pipeline);
 
-#if RESHADE_ADDON && !RESHADE_ADDON_LITE
+#if RESHADE_ADDON >= 2
 	if (!reshade::has_addon_event<reshade::addon_event::bind_pipeline>())
 		return;
 
@@ -335,8 +355,7 @@ void VKAPI_CALL vkCmdSetViewport(VkCommandBuffer commandBuffer, uint32_t firstVi
 		viewport_data[i].height = -viewport_data[i].height;
 	}
 
-	reshade::invoke_addon_event<reshade::addon_event::bind_viewports>(
-		cmd_impl, firstViewport, viewportCount, viewport_data.p);
+	reshade::invoke_addon_event<reshade::addon_event::bind_viewports>(cmd_impl, firstViewport, viewportCount, viewport_data.p);
 #endif
 }
 void VKAPI_CALL vkCmdSetScissor(VkCommandBuffer commandBuffer, uint32_t firstScissor, uint32_t scissorCount, const VkRect2D *pScissors)
@@ -361,8 +380,7 @@ void VKAPI_CALL vkCmdSetScissor(VkCommandBuffer commandBuffer, uint32_t firstSci
 		rect_data[i].bottom = pScissors[i].offset.y + static_cast<int32_t>(pScissors[i].extent.height);
 	}
 
-	reshade::invoke_addon_event<reshade::addon_event::bind_scissor_rects>(
-		cmd_impl, firstScissor, scissorCount, rect_data.p);
+	reshade::invoke_addon_event<reshade::addon_event::bind_scissor_rects>(cmd_impl, firstScissor, scissorCount, rect_data.p);
 #endif
 }
 
@@ -373,7 +391,7 @@ void VKAPI_CALL vkCmdSetDepthBias(VkCommandBuffer commandBuffer, float depthBias
 	GET_DISPATCH_PTR_FROM(CmdSetDepthBias, device_impl);
 	trampoline(commandBuffer, depthBiasConstantFactor, depthBiasClamp, depthBiasSlopeFactor);
 
-#if RESHADE_ADDON && !RESHADE_ADDON_LITE
+#if RESHADE_ADDON >= 2
 	if (!reshade::has_addon_event<reshade::addon_event::bind_pipeline_states>())
 		return;
 
@@ -382,8 +400,7 @@ void VKAPI_CALL vkCmdSetDepthBias(VkCommandBuffer commandBuffer, float depthBias
 	const reshade::api::dynamic_state states[3] = { reshade::api::dynamic_state::depth_bias, reshade::api::dynamic_state::depth_bias_clamp, reshade::api::dynamic_state::depth_bias_slope_scaled };
 	const uint32_t values[3] = { *reinterpret_cast<const uint32_t *>(&depthBiasConstantFactor), *reinterpret_cast<const uint32_t *>(&depthBiasClamp), *reinterpret_cast<const uint32_t *>(&depthBiasSlopeFactor) };
 
-	reshade::invoke_addon_event<reshade::addon_event::bind_pipeline_states>(
-		cmd_impl, 3, states, values);
+	reshade::invoke_addon_event<reshade::addon_event::bind_pipeline_states>(cmd_impl, static_cast<uint32_t>(std::size(states)), states, values);
 #endif
 }
 void VKAPI_CALL vkCmdSetBlendConstants(VkCommandBuffer commandBuffer, const float blendConstants[4])
@@ -393,7 +410,7 @@ void VKAPI_CALL vkCmdSetBlendConstants(VkCommandBuffer commandBuffer, const floa
 	GET_DISPATCH_PTR_FROM(CmdSetBlendConstants, device_impl);
 	trampoline(commandBuffer, blendConstants);
 
-#if RESHADE_ADDON && !RESHADE_ADDON_LITE
+#if RESHADE_ADDON >= 2
 	assert(blendConstants != nullptr);
 
 	if (!reshade::has_addon_event<reshade::addon_event::bind_pipeline_states>())
@@ -401,14 +418,14 @@ void VKAPI_CALL vkCmdSetBlendConstants(VkCommandBuffer commandBuffer, const floa
 
 	reshade::vulkan::command_list_impl *const cmd_impl = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_COMMAND_BUFFER>(commandBuffer);
 
-	const reshade::api::dynamic_state state = reshade::api::dynamic_state::blend_constant;
-	const uint32_t value =
+	const reshade::api::dynamic_state states[1] = { reshade::api::dynamic_state::blend_constant };
+	const uint32_t values[1] = {
 		((static_cast<uint32_t>(blendConstants[0] * 255.f) & 0xFF)      ) |
 		((static_cast<uint32_t>(blendConstants[1] * 255.f) & 0xFF) <<  8) |
 		((static_cast<uint32_t>(blendConstants[2] * 255.f) & 0xFF) << 16) |
-		((static_cast<uint32_t>(blendConstants[3] * 255.f) & 0xFF) << 24);
+		((static_cast<uint32_t>(blendConstants[3] * 255.f) & 0xFF) << 24) };
 
-	reshade::invoke_addon_event<reshade::addon_event::bind_pipeline_states>(cmd_impl, 1, &state, &value);
+	reshade::invoke_addon_event<reshade::addon_event::bind_pipeline_states>(cmd_impl, static_cast<uint32_t>(std::size(states)), states, values);
 #endif
 }
 void VKAPI_CALL vkCmdSetStencilCompareMask(VkCommandBuffer commandBuffer, VkStencilFaceFlags faceMask, uint32_t compareMask)
@@ -418,15 +435,16 @@ void VKAPI_CALL vkCmdSetStencilCompareMask(VkCommandBuffer commandBuffer, VkSten
 	GET_DISPATCH_PTR_FROM(CmdSetStencilCompareMask, device_impl);
 	trampoline(commandBuffer, faceMask, compareMask);
 
-#if RESHADE_ADDON && !RESHADE_ADDON_LITE
-	if (faceMask != VK_STENCIL_FACE_FRONT_AND_BACK || !reshade::has_addon_event<reshade::addon_event::bind_pipeline_states>())
+#if RESHADE_ADDON >= 2
+	if (!reshade::has_addon_event<reshade::addon_event::bind_pipeline_states>())
 		return;
 
 	reshade::vulkan::command_list_impl *const cmd_impl = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_COMMAND_BUFFER>(commandBuffer);
 
-	const reshade::api::dynamic_state state = reshade::api::dynamic_state::stencil_read_mask;
+	const reshade::api::dynamic_state states[2] = { reshade::api::dynamic_state::front_stencil_read_mask, reshade::api::dynamic_state::back_stencil_read_mask };
+	const uint32_t values[2] = { compareMask, compareMask };
 
-	reshade::invoke_addon_event<reshade::addon_event::bind_pipeline_states>(cmd_impl, 1, &state, &compareMask);
+	reshade::invoke_addon_event<reshade::addon_event::bind_pipeline_states>(cmd_impl, faceMask == VK_STENCIL_FACE_FRONT_AND_BACK ? 2 : 1, &states[faceMask == VK_STENCIL_FACE_BACK_BIT ? 1 : 0], values);
 #endif
 }
 void VKAPI_CALL vkCmdSetStencilWriteMask(VkCommandBuffer commandBuffer, VkStencilFaceFlags faceMask, uint32_t writeMask)
@@ -436,15 +454,16 @@ void VKAPI_CALL vkCmdSetStencilWriteMask(VkCommandBuffer commandBuffer, VkStenci
 	GET_DISPATCH_PTR_FROM(CmdSetStencilWriteMask, device_impl);
 	trampoline(commandBuffer, faceMask, writeMask);
 
-#if RESHADE_ADDON && !RESHADE_ADDON_LITE
-	if (faceMask != VK_STENCIL_FACE_FRONT_AND_BACK || !reshade::has_addon_event<reshade::addon_event::bind_pipeline_states>())
+#if RESHADE_ADDON >= 2
+	if (!reshade::has_addon_event<reshade::addon_event::bind_pipeline_states>())
 		return;
 
 	reshade::vulkan::command_list_impl *const cmd_impl = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_COMMAND_BUFFER>(commandBuffer);
 
-	const reshade::api::dynamic_state state = reshade::api::dynamic_state::stencil_write_mask;
+	const reshade::api::dynamic_state states[2] = { reshade::api::dynamic_state::front_stencil_write_mask, reshade::api::dynamic_state::back_stencil_write_mask };
+	const uint32_t values[2] = { writeMask, writeMask };
 
-	reshade::invoke_addon_event<reshade::addon_event::bind_pipeline_states>(cmd_impl, 1, &state, &writeMask);
+	reshade::invoke_addon_event<reshade::addon_event::bind_pipeline_states>(cmd_impl, faceMask == VK_STENCIL_FACE_FRONT_AND_BACK ? 2 : 1, &states[faceMask == VK_STENCIL_FACE_BACK_BIT ? 1 : 0], values);
 #endif
 }
 void VKAPI_CALL vkCmdSetStencilReference(VkCommandBuffer commandBuffer, VkStencilFaceFlags faceMask, uint32_t reference)
@@ -454,15 +473,16 @@ void VKAPI_CALL vkCmdSetStencilReference(VkCommandBuffer commandBuffer, VkStenci
 	GET_DISPATCH_PTR_FROM(CmdSetStencilReference, device_impl);
 	trampoline(commandBuffer, faceMask, reference);
 
-#if RESHADE_ADDON && !RESHADE_ADDON_LITE
-	if (faceMask != VK_STENCIL_FACE_FRONT_AND_BACK || !reshade::has_addon_event<reshade::addon_event::bind_pipeline_states>())
+#if RESHADE_ADDON >= 2
+	if (!reshade::has_addon_event<reshade::addon_event::bind_pipeline_states>())
 		return;
 
 	reshade::vulkan::command_list_impl *const cmd_impl = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_COMMAND_BUFFER>(commandBuffer);
 
-	const reshade::api::dynamic_state state = reshade::api::dynamic_state::stencil_reference_value;
+	const reshade::api::dynamic_state states[2] = { reshade::api::dynamic_state::front_stencil_reference_value, reshade::api::dynamic_state::back_stencil_reference_value };
+	const uint32_t values[2] = { reference, reference };
 
-	reshade::invoke_addon_event<reshade::addon_event::bind_pipeline_states>(cmd_impl, 1, &state, &reference);
+	reshade::invoke_addon_event<reshade::addon_event::bind_pipeline_states>(cmd_impl, faceMask == VK_STENCIL_FACE_FRONT_AND_BACK ? 2 : 1, &states[faceMask == VK_STENCIL_FACE_BACK_BIT ? 1 : 0], values);
 #endif
 }
 
@@ -473,8 +493,8 @@ void VKAPI_CALL vkCmdBindDescriptorSets(VkCommandBuffer commandBuffer, VkPipelin
 	GET_DISPATCH_PTR_FROM(CmdBindDescriptorSets, device_impl);
 	trampoline(commandBuffer, pipelineBindPoint, layout, firstSet, descriptorSetCount, pDescriptorSets, dynamicOffsetCount, pDynamicOffsets);
 
-#if RESHADE_ADDON && !RESHADE_ADDON_LITE
-	if (!reshade::has_addon_event<reshade::addon_event::bind_descriptor_sets>())
+#if RESHADE_ADDON >= 2
+	if (!reshade::has_addon_event<reshade::addon_event::bind_descriptor_tables>())
 		return;
 
 	reshade::vulkan::command_list_impl *const cmd_impl = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_COMMAND_BUFFER>(commandBuffer);
@@ -484,12 +504,12 @@ void VKAPI_CALL vkCmdBindDescriptorSets(VkCommandBuffer commandBuffer, VkPipelin
 		pipelineBindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS ? reshade::api::shader_stage::all_graphics :
 		static_cast<reshade::api::shader_stage>(0); // Unknown pipeline bind point
 
-	reshade::invoke_addon_event<reshade::addon_event::bind_descriptor_sets>(
+	reshade::invoke_addon_event<reshade::addon_event::bind_descriptor_tables>(
 		cmd_impl,
 		shader_stages,
 		reshade::api::pipeline_layout { (uint64_t)layout },
 		firstSet, descriptorSetCount,
-		reinterpret_cast<const reshade::api::descriptor_set *>(pDescriptorSets));
+		reinterpret_cast<const reshade::api::descriptor_table *>(pDescriptorSets));
 #endif
 }
 
@@ -500,7 +520,7 @@ void VKAPI_CALL vkCmdBindIndexBuffer(VkCommandBuffer commandBuffer, VkBuffer buf
 	GET_DISPATCH_PTR_FROM(CmdBindIndexBuffer, device_impl);
 	trampoline(commandBuffer, buffer, offset, indexType);
 
-#if RESHADE_ADDON && !RESHADE_ADDON_LITE
+#if RESHADE_ADDON >= 2
 	if (!reshade::has_addon_event<reshade::addon_event::bind_index_buffer>())
 		return;
 
@@ -517,13 +537,11 @@ void VKAPI_CALL vkCmdBindVertexBuffers(VkCommandBuffer commandBuffer, uint32_t f
 	GET_DISPATCH_PTR_FROM(CmdBindVertexBuffers, device_impl);
 	trampoline(commandBuffer, firstBinding, bindingCount, pBuffers, pOffsets);
 
-#if RESHADE_ADDON && !RESHADE_ADDON_LITE
+#if RESHADE_ADDON >= 2
 	if (!reshade::has_addon_event<reshade::addon_event::bind_vertex_buffers>())
 		return;
 
 	reshade::vulkan::command_list_impl *const cmd_impl = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_COMMAND_BUFFER>(commandBuffer);
-
-	static_assert(sizeof(*pBuffers) == sizeof(reshade::api::resource));
 
 	reshade::invoke_addon_event<reshade::addon_event::bind_vertex_buffers>(
 		cmd_impl, firstBinding, bindingCount, reinterpret_cast<const reshade::api::resource *>(pBuffers), pOffsets, nullptr);
@@ -533,6 +551,7 @@ void VKAPI_CALL vkCmdBindVertexBuffers(VkCommandBuffer commandBuffer, uint32_t f
 void VKAPI_CALL vkCmdDraw(VkCommandBuffer commandBuffer, uint32_t vertexCount, uint32_t instanceCount, uint32_t firstVertex, uint32_t firstInstance)
 {
 	reshade::vulkan::device_impl *const device_impl = g_vulkan_devices.at(dispatch_key_from_handle(commandBuffer));
+
 #if RESHADE_ADDON
 	reshade::vulkan::command_list_impl *const cmd_impl = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_COMMAND_BUFFER>(commandBuffer);
 
@@ -546,6 +565,7 @@ void VKAPI_CALL vkCmdDraw(VkCommandBuffer commandBuffer, uint32_t vertexCount, u
 void VKAPI_CALL vkCmdDrawIndexed(VkCommandBuffer commandBuffer, uint32_t indexCount, uint32_t instanceCount, uint32_t firstIndex, int32_t vertexOffset, uint32_t firstInstance)
 {
 	reshade::vulkan::device_impl *const device_impl = g_vulkan_devices.at(dispatch_key_from_handle(commandBuffer));
+
 #if RESHADE_ADDON
 	reshade::vulkan::command_list_impl *const cmd_impl = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_COMMAND_BUFFER>(commandBuffer);
 
@@ -559,6 +579,7 @@ void VKAPI_CALL vkCmdDrawIndexed(VkCommandBuffer commandBuffer, uint32_t indexCo
 void VKAPI_CALL vkCmdDrawIndirect(VkCommandBuffer commandBuffer, VkBuffer buffer, VkDeviceSize offset, uint32_t drawCount, uint32_t stride)
 {
 	reshade::vulkan::device_impl *const device_impl = g_vulkan_devices.at(dispatch_key_from_handle(commandBuffer));
+
 #if RESHADE_ADDON
 	reshade::vulkan::command_list_impl *const cmd_impl = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_COMMAND_BUFFER>(commandBuffer);
 
@@ -572,6 +593,7 @@ void VKAPI_CALL vkCmdDrawIndirect(VkCommandBuffer commandBuffer, VkBuffer buffer
 void VKAPI_CALL vkCmdDrawIndexedIndirect(VkCommandBuffer commandBuffer, VkBuffer buffer, VkDeviceSize offset, uint32_t drawCount, uint32_t stride)
 {
 	reshade::vulkan::device_impl *const device_impl = g_vulkan_devices.at(dispatch_key_from_handle(commandBuffer));
+
 #if RESHADE_ADDON
 	reshade::vulkan::command_list_impl *const cmd_impl = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_COMMAND_BUFFER>(commandBuffer);
 
@@ -585,6 +607,7 @@ void VKAPI_CALL vkCmdDrawIndexedIndirect(VkCommandBuffer commandBuffer, VkBuffer
 void VKAPI_CALL vkCmdDispatch(VkCommandBuffer commandBuffer, uint32_t groupCountX, uint32_t groupCountY, uint32_t groupCountZ)
 {
 	reshade::vulkan::device_impl *const device_impl = g_vulkan_devices.at(dispatch_key_from_handle(commandBuffer));
+
 #if RESHADE_ADDON
 	reshade::vulkan::command_list_impl *const cmd_impl = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_COMMAND_BUFFER>(commandBuffer);
 
@@ -598,6 +621,7 @@ void VKAPI_CALL vkCmdDispatch(VkCommandBuffer commandBuffer, uint32_t groupCount
 void VKAPI_CALL vkCmdDispatchIndirect(VkCommandBuffer commandBuffer, VkBuffer buffer, VkDeviceSize offset)
 {
 	reshade::vulkan::device_impl *const device_impl = g_vulkan_devices.at(dispatch_key_from_handle(commandBuffer));
+
 #if RESHADE_ADDON
 	reshade::vulkan::command_list_impl *const cmd_impl = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_COMMAND_BUFFER>(commandBuffer);
 
@@ -614,7 +638,7 @@ void VKAPI_CALL vkCmdCopyBuffer(VkCommandBuffer commandBuffer, VkBuffer srcBuffe
 	reshade::vulkan::device_impl *const device_impl = g_vulkan_devices.at(dispatch_key_from_handle(commandBuffer));
 	GET_DISPATCH_PTR_FROM(CmdCopyBuffer, device_impl);
 
-#if RESHADE_ADDON && !RESHADE_ADDON_LITE
+#if RESHADE_ADDON >= 2
 	if (reshade::has_addon_event<reshade::addon_event::copy_buffer_region>())
 	{
 		reshade::vulkan::command_list_impl *const cmd_impl = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_COMMAND_BUFFER>(commandBuffer);
@@ -629,6 +653,7 @@ void VKAPI_CALL vkCmdCopyBuffer(VkCommandBuffer commandBuffer, VkBuffer srcBuffe
 					reshade::api::resource { (uint64_t)dstBuffer }, region.dstOffset, region.size))
 				continue;
 
+			// Handle each region separately, so that they can be individually skipped
 			trampoline(commandBuffer, srcBuffer, dstBuffer, 1, &region);
 		}
 	}
@@ -641,7 +666,7 @@ void VKAPI_CALL vkCmdCopyImage(VkCommandBuffer commandBuffer, VkImage srcImage, 
 	reshade::vulkan::device_impl *const device_impl = g_vulkan_devices.at(dispatch_key_from_handle(commandBuffer));
 	GET_DISPATCH_PTR_FROM(CmdCopyImage, device_impl);
 
-#if RESHADE_ADDON && !RESHADE_ADDON_LITE
+#if RESHADE_ADDON >= 2
 	if (reshade::has_addon_event<reshade::addon_event::copy_texture_region>())
 	{
 		reshade::vulkan::command_list_impl *const cmd_impl = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_COMMAND_BUFFER>(commandBuffer);
@@ -674,6 +699,7 @@ void VKAPI_CALL vkCmdCopyImage(VkCommandBuffer commandBuffer, VkImage srcImage, 
 					reshade::api::filter_mode::min_mag_mip_point))
 				continue;
 
+			// Handle each region separately, so that they can be individually skipped
 			trampoline(commandBuffer, srcImage, srcImageLayout, dstImage, dstImageLayout, 1, &region);
 		}
 	}
@@ -686,7 +712,7 @@ void VKAPI_CALL vkCmdBlitImage(VkCommandBuffer commandBuffer, VkImage srcImage, 
 	reshade::vulkan::device_impl *const device_impl = g_vulkan_devices.at(dispatch_key_from_handle(commandBuffer));
 	GET_DISPATCH_PTR_FROM(CmdBlitImage, device_impl);
 
-#if RESHADE_ADDON && !RESHADE_ADDON_LITE
+#if RESHADE_ADDON >= 2
 	if (reshade::has_addon_event<reshade::addon_event::copy_texture_region>())
 	{
 		reshade::vulkan::command_list_impl *const cmd_impl = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_COMMAND_BUFFER>(commandBuffer);
@@ -731,7 +757,7 @@ void VKAPI_CALL vkCmdCopyBufferToImage(VkCommandBuffer commandBuffer, VkBuffer s
 	reshade::vulkan::device_impl *const device_impl = g_vulkan_devices.at(dispatch_key_from_handle(commandBuffer));
 	GET_DISPATCH_PTR_FROM(CmdCopyBufferToImage, device_impl);
 
-#if RESHADE_ADDON && !RESHADE_ADDON_LITE
+#if RESHADE_ADDON >= 2
 	if (reshade::has_addon_event<reshade::addon_event::copy_buffer_to_texture>())
 	{
 		reshade::vulkan::command_list_impl *const cmd_impl = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_COMMAND_BUFFER>(commandBuffer);
@@ -767,7 +793,7 @@ void VKAPI_CALL vkCmdCopyImageToBuffer(VkCommandBuffer commandBuffer, VkImage sr
 	reshade::vulkan::device_impl *const device_impl = g_vulkan_devices.at(dispatch_key_from_handle(commandBuffer));
 	GET_DISPATCH_PTR_FROM(CmdCopyImageToBuffer, device_impl);
 
-#if RESHADE_ADDON && !RESHADE_ADDON_LITE
+#if RESHADE_ADDON >= 2
 	if (reshade::has_addon_event<reshade::addon_event::copy_texture_to_buffer>())
 	{
 		reshade::vulkan::command_list_impl *const cmd_impl = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_COMMAND_BUFFER>(commandBuffer);
@@ -830,10 +856,11 @@ void VKAPI_CALL vkCmdClearColorImage(VkCommandBuffer commandBuffer, VkImage imag
 		device_impl->_dispatch_table.CmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1, &transition);
 
 		const VkImageView default_view = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_IMAGE>(image)->default_view;
-		assert(default_view != VK_NULL_HANDLE);
+		assert(default_view != VK_NULL_HANDLE); // A default view is created for every image that can potentially be cleared, see 'create_default_view' in vulkan_hooks_device.cpp
 
 		const bool skip = reshade::invoke_addon_event<reshade::addon_event::clear_render_target_view>(cmd_impl, reshade::api::resource_view { (uint64_t)default_view }, pColor->float32, 0, nullptr);
 
+		// Revert back to previous state
 		std::swap(transition.oldLayout, transition.newLayout);
 		device_impl->_dispatch_table.CmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1, &transition);
 
@@ -876,7 +903,7 @@ void VKAPI_CALL vkCmdClearDepthStencilImage(VkCommandBuffer commandBuffer, VkIma
 		device_impl->_dispatch_table.CmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1, &transition);
 
 		const VkImageView default_view = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_IMAGE>(image)->default_view;
-		assert(default_view != VK_NULL_HANDLE);
+		assert(default_view != VK_NULL_HANDLE); // A default view is created for every image that can potentially be cleared, see 'create_default_view' in vulkan_hooks_device.cpp
 
 		const bool skip = reshade::invoke_addon_event<reshade::addon_event::clear_depth_stencil_view>(
 			cmd_impl,
@@ -885,6 +912,7 @@ void VKAPI_CALL vkCmdClearDepthStencilImage(VkCommandBuffer commandBuffer, VkIma
 			transition.subresourceRange.aspectMask & VK_IMAGE_ASPECT_STENCIL_BIT ? reinterpret_cast<const uint8_t *>(&pDepthStencil->stencil) : nullptr,
 			0, nullptr);
 
+		// Revert back to previous state
 		std::swap(transition.oldLayout, transition.newLayout);
 		device_impl->_dispatch_table.CmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1, &transition);
 
@@ -899,11 +927,9 @@ void VKAPI_CALL vkCmdClearDepthStencilImage(VkCommandBuffer commandBuffer, VkIma
 void VKAPI_CALL vkCmdClearAttachments(VkCommandBuffer commandBuffer, uint32_t attachmentCount, const VkClearAttachment *pAttachments, uint32_t rectCount, const VkClearRect *pRects)
 {
 	reshade::vulkan::device_impl *const device_impl = g_vulkan_devices.at(dispatch_key_from_handle(commandBuffer));
+	GET_DISPATCH_PTR_FROM(CmdClearAttachments, device_impl);
 
-	VkClearAttachment *attachments = const_cast<VkClearAttachment *>(pAttachments);
 #if RESHADE_ADDON
-	temp_mem<VkClearAttachment> new_attachments(attachmentCount);
-
 	if (reshade::has_addon_event<reshade::addon_event::clear_depth_stencil_view>() ||
 		reshade::has_addon_event<reshade::addon_event::clear_render_target_view>())
 	{
@@ -918,7 +944,6 @@ void VKAPI_CALL vkCmdClearAttachments(VkCommandBuffer commandBuffer, uint32_t at
 			rect_data[i].bottom = pRects[i].rect.offset.y + static_cast<int32_t>(pRects[i].rect.extent.height);
 		}
 
-		uint32_t new_attachment_count = 0;
 		for (uint32_t i = 0; i < attachmentCount; ++i)
 		{
 			const VkClearAttachment &clear_attachment = pAttachments[i];
@@ -948,19 +973,13 @@ void VKAPI_CALL vkCmdClearAttachments(VkCommandBuffer commandBuffer, uint32_t at
 					continue;
 			}
 
-			new_attachments[new_attachment_count++] = clear_attachment;
+			// Handle each attachment separately, so that they can be individually skipped
+			trampoline(commandBuffer, 1, &clear_attachment, rectCount, pRects);
 		}
-
-		if (new_attachment_count == 0)
-			return;
-
-		attachments = new_attachments.p;
-		attachmentCount = new_attachment_count;
 	}
+	else
 #endif
-
-	GET_DISPATCH_PTR_FROM(CmdClearAttachments, device_impl);
-	trampoline(commandBuffer, attachmentCount, attachments, rectCount, pRects);
+	trampoline(commandBuffer, attachmentCount, pAttachments, rectCount, pRects);
 }
 
 void VKAPI_CALL vkCmdResolveImage(VkCommandBuffer commandBuffer, VkImage srcImage, VkImageLayout srcImageLayout, VkImage dstImage, VkImageLayout dstImageLayout, uint32_t regionCount, const VkImageResolve *pRegions)
@@ -968,7 +987,7 @@ void VKAPI_CALL vkCmdResolveImage(VkCommandBuffer commandBuffer, VkImage srcImag
 	reshade::vulkan::device_impl *const device_impl = g_vulkan_devices.at(dispatch_key_from_handle(commandBuffer));
 	GET_DISPATCH_PTR_FROM(CmdResolveImage, device_impl);
 
-#if RESHADE_ADDON && !RESHADE_ADDON_LITE
+#if RESHADE_ADDON >= 2
 	if (reshade::has_addon_event<reshade::addon_event::resolve_texture_region>())
 	{
 		reshade::vulkan::command_list_impl *const cmd_impl = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_COMMAND_BUFFER>(commandBuffer);
@@ -1007,7 +1026,7 @@ void VKAPI_CALL vkCmdPipelineBarrier(VkCommandBuffer commandBuffer, VkPipelineSt
 	GET_DISPATCH_PTR_FROM(CmdPipelineBarrier, device_impl);
 	trampoline(commandBuffer, srcStageMask, dstStageMask, dependencyFlags, memoryBarrierCount, pMemoryBarriers, bufferMemoryBarrierCount, pBufferMemoryBarriers, imageMemoryBarrierCount, pImageMemoryBarriers);
 
-#if RESHADE_ADDON && !RESHADE_ADDON_LITE
+#if RESHADE_ADDON >= 2
 	const uint32_t num_barriers = memoryBarrierCount + bufferMemoryBarrierCount + imageMemoryBarrierCount;
 
 	if (num_barriers == 0 || !reshade::has_addon_event<reshade::addon_event::barrier>())
@@ -1052,12 +1071,15 @@ void VKAPI_CALL vkCmdBeginQuery(VkCommandBuffer commandBuffer, VkQueryPool query
 {
 	reshade::vulkan::device_impl *const device_impl = g_vulkan_devices.at(dispatch_key_from_handle(commandBuffer));
 
-#if RESHADE_ADDON && !RESHADE_ADDON_LITE
-	reshade::vulkan::command_list_impl *const cmd_impl = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_COMMAND_BUFFER>(commandBuffer);
-	const auto pool_data = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_QUERY_POOL>(queryPool);
+#if RESHADE_ADDON >= 2
+	if (reshade::has_addon_event<reshade::addon_event::begin_query>())
+	{
+		reshade::vulkan::command_list_impl *const cmd_impl = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_COMMAND_BUFFER>(commandBuffer);
+		const auto pool_data = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_QUERY_POOL>(queryPool);
 
-	if (reshade::invoke_addon_event<reshade::addon_event::begin_query>(cmd_impl, reshade::api::query_pool { (uint64_t)queryPool }, reshade::vulkan::convert_query_type(pool_data->type), query))
-		return;
+		if (reshade::invoke_addon_event<reshade::addon_event::begin_query>(cmd_impl, reshade::api::query_heap { (uint64_t)queryPool }, reshade::vulkan::convert_query_type(pool_data->type), query))
+			return;
+	}
 #endif
 
 	GET_DISPATCH_PTR_FROM(CmdBeginQuery, device_impl);
@@ -1067,12 +1089,15 @@ void VKAPI_CALL vkCmdEndQuery(VkCommandBuffer commandBuffer, VkQueryPool queryPo
 {
 	reshade::vulkan::device_impl *const device_impl = g_vulkan_devices.at(dispatch_key_from_handle(commandBuffer));
 
-#if RESHADE_ADDON && !RESHADE_ADDON_LITE
-	reshade::vulkan::command_list_impl *const cmd_impl = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_COMMAND_BUFFER>(commandBuffer);
-	const auto pool_data = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_QUERY_POOL>(queryPool);
+#if RESHADE_ADDON >= 2
+	if (reshade::has_addon_event<reshade::addon_event::end_query>())
+	{
+		reshade::vulkan::command_list_impl *const cmd_impl = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_COMMAND_BUFFER>(commandBuffer);
+		const auto pool_data = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_QUERY_POOL>(queryPool);
 
-	if (reshade::invoke_addon_event<reshade::addon_event::end_query>(cmd_impl, reshade::api::query_pool { (uint64_t)queryPool }, reshade::vulkan::convert_query_type(pool_data->type), query))
-		return;
+		if (reshade::invoke_addon_event<reshade::addon_event::end_query>(cmd_impl, reshade::api::query_heap { (uint64_t)queryPool }, reshade::vulkan::convert_query_type(pool_data->type), query))
+			return;
+	}
 #endif
 
 	GET_DISPATCH_PTR_FROM(CmdEndQuery, device_impl);
@@ -1082,12 +1107,15 @@ void VKAPI_CALL vkCmdWriteTimestamp(VkCommandBuffer commandBuffer, VkPipelineSta
 {
 	reshade::vulkan::device_impl *const device_impl = g_vulkan_devices.at(dispatch_key_from_handle(commandBuffer));
 
-#if RESHADE_ADDON && !RESHADE_ADDON_LITE
-	reshade::vulkan::command_list_impl *const cmd_impl = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_COMMAND_BUFFER>(commandBuffer);
-	assert(device_impl->get_private_data_for_object<VK_OBJECT_TYPE_QUERY_POOL>(queryPool)->type == VK_QUERY_TYPE_TIMESTAMP);
+#if RESHADE_ADDON >= 2
+	if (reshade::has_addon_event<reshade::addon_event::end_query>())
+	{
+		reshade::vulkan::command_list_impl *const cmd_impl = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_COMMAND_BUFFER>(commandBuffer);
+		assert(device_impl->get_private_data_for_object<VK_OBJECT_TYPE_QUERY_POOL>(queryPool)->type == VK_QUERY_TYPE_TIMESTAMP);
 
-	if (reshade::invoke_addon_event<reshade::addon_event::end_query>(cmd_impl, reshade::api::query_pool { (uint64_t)queryPool }, reshade::api::query_type::timestamp, query))
-		return;
+		if (reshade::invoke_addon_event<reshade::addon_event::end_query>(cmd_impl, reshade::api::query_heap { (uint64_t)queryPool }, reshade::api::query_type::timestamp, query))
+			return;
+	}
 #endif
 
 	GET_DISPATCH_PTR_FROM(CmdWriteTimestamp, device_impl);
@@ -1098,22 +1126,25 @@ void VKAPI_CALL vkCmdCopyQueryPoolResults(VkCommandBuffer commandBuffer, VkQuery
 {
 	reshade::vulkan::device_impl *const device_impl = g_vulkan_devices.at(dispatch_key_from_handle(commandBuffer));
 
-#if RESHADE_ADDON && !RESHADE_ADDON_LITE
-	reshade::vulkan::command_list_impl *const cmd_impl = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_COMMAND_BUFFER>(commandBuffer);
-	const auto pool_data = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_QUERY_POOL>(queryPool);
+#if RESHADE_ADDON >= 2
+	if (reshade::has_addon_event<reshade::addon_event::copy_query_heap_results>())
+	{
+		reshade::vulkan::command_list_impl *const cmd_impl = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_COMMAND_BUFFER>(commandBuffer);
+		const auto pool_data = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_QUERY_POOL>(queryPool);
 
-	assert(stride <= std::numeric_limits<uint32_t>::max());
+		assert(stride <= std::numeric_limits<uint32_t>::max());
 
-	if (reshade::invoke_addon_event<reshade::addon_event::copy_query_pool_results>(
-			cmd_impl,
-			reshade::api::query_pool { (uint64_t)queryPool },
-			reshade::vulkan::convert_query_type(pool_data->type),
-			firstQuery,
-			queryCount,
-			reshade::api::resource { (uint64_t)dstBuffer },
-			dstOffset,
-			static_cast<uint32_t>(stride)))
-		return;
+		if (reshade::invoke_addon_event<reshade::addon_event::copy_query_heap_results>(
+				cmd_impl,
+				reshade::api::query_heap { (uint64_t)queryPool },
+				reshade::vulkan::convert_query_type(pool_data->type),
+				firstQuery,
+				queryCount,
+				reshade::api::resource { (uint64_t)dstBuffer },
+				dstOffset,
+				static_cast<uint32_t>(stride)))
+			return;
+	}
 #endif
 
 	GET_DISPATCH_PTR_FROM(CmdCopyQueryPoolResults, device_impl);
@@ -1127,7 +1158,7 @@ void VKAPI_CALL vkCmdPushConstants(VkCommandBuffer commandBuffer, VkPipelineLayo
 	GET_DISPATCH_PTR_FROM(CmdPushConstants, device_impl);
 	trampoline(commandBuffer, layout, stageFlags, offset, size, pValues);
 
-#if RESHADE_ADDON && !RESHADE_ADDON_LITE
+#if RESHADE_ADDON >= 2
 	if (!reshade::has_addon_event<reshade::addon_event::push_constants>())
 		return;
 
@@ -1159,6 +1190,8 @@ void VKAPI_CALL vkCmdBeginRenderPass(VkCommandBuffer commandBuffer, const VkRend
 	cmd_impl->current_framebuffer = pRenderPassBegin->framebuffer;
 
 	invoke_begin_render_pass_event(device_impl, cmd_impl, pRenderPassBegin);
+
+	cmd_impl->_is_in_render_pass = true;
 #endif
 
 	GET_DISPATCH_PTR_FROM(CmdBeginRenderPass, device_impl);
@@ -1200,6 +1233,8 @@ void VKAPI_CALL vkCmdEndRenderPass(VkCommandBuffer commandBuffer)
 
 	std::memset(cmd_impl->current_color_attachments, 0, sizeof(cmd_impl->current_color_attachments));
 	cmd_impl->current_depth_stencil_attachment = VK_NULL_HANDLE;
+
+	cmd_impl->_is_in_render_pass = false;
 #endif
 
 	GET_DISPATCH_PTR_FROM(CmdEndRenderPass, device_impl);
@@ -1231,6 +1266,7 @@ void VKAPI_CALL vkCmdExecuteCommands(VkCommandBuffer commandBuffer, uint32_t com
 void VKAPI_CALL vkCmdDrawIndirectCount(VkCommandBuffer commandBuffer, VkBuffer buffer, VkDeviceSize offset, VkBuffer countBuffer, VkDeviceSize countBufferOffset, uint32_t maxDrawCount, uint32_t stride)
 {
 	reshade::vulkan::device_impl *const device_impl = g_vulkan_devices.at(dispatch_key_from_handle(commandBuffer));
+
 #if RESHADE_ADDON
 	reshade::vulkan::command_list_impl *const cmd_impl = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_COMMAND_BUFFER>(commandBuffer);
 
@@ -1244,6 +1280,7 @@ void VKAPI_CALL vkCmdDrawIndirectCount(VkCommandBuffer commandBuffer, VkBuffer b
 void VKAPI_CALL vkCmdDrawIndexedIndirectCount(VkCommandBuffer commandBuffer, VkBuffer buffer, VkDeviceSize offset, VkBuffer countBuffer, VkDeviceSize countBufferOffset, uint32_t maxDrawCount, uint32_t stride)
 {
 	reshade::vulkan::device_impl *const device_impl = g_vulkan_devices.at(dispatch_key_from_handle(commandBuffer));
+
 #if RESHADE_ADDON
 	reshade::vulkan::command_list_impl *const cmd_impl = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_COMMAND_BUFFER>(commandBuffer);
 
@@ -1269,6 +1306,8 @@ void VKAPI_CALL vkCmdBeginRenderPass2(VkCommandBuffer commandBuffer, const VkRen
 	cmd_impl->current_framebuffer = pRenderPassBegin->framebuffer;
 
 	invoke_begin_render_pass_event(device_impl, cmd_impl, pRenderPassBegin);
+
+	cmd_impl->_is_in_render_pass = true;
 #endif
 
 	GET_DISPATCH_PTR_FROM(CmdBeginRenderPass2, device_impl);
@@ -1310,6 +1349,8 @@ void VKAPI_CALL vkCmdEndRenderPass2(VkCommandBuffer commandBuffer, const VkSubpa
 
 	std::memset(cmd_impl->current_color_attachments, 0, sizeof(cmd_impl->current_color_attachments));
 	cmd_impl->current_depth_stencil_attachment = VK_NULL_HANDLE;
+
+	cmd_impl->_is_in_render_pass = false;
 #endif
 
 	GET_DISPATCH_PTR_FROM(CmdEndRenderPass2, device_impl);
@@ -1323,7 +1364,7 @@ void VKAPI_CALL vkCmdPipelineBarrier2(VkCommandBuffer commandBuffer, const VkDep
 	GET_DISPATCH_PTR_FROM(CmdPipelineBarrier2, device_impl);
 	trampoline(commandBuffer, pDependencyInfo);
 
-#if RESHADE_ADDON && !RESHADE_ADDON_LITE
+#if RESHADE_ADDON >= 2
 	assert(pDependencyInfo != nullptr);
 
 	const uint32_t num_barriers = pDependencyInfo->memoryBarrierCount + pDependencyInfo->bufferMemoryBarrierCount + pDependencyInfo->imageMemoryBarrierCount;
@@ -1342,16 +1383,16 @@ void VKAPI_CALL vkCmdPipelineBarrier2(VkCommandBuffer commandBuffer, const VkDep
 		const VkMemoryBarrier2 &barrier = pDependencyInfo->pMemoryBarriers[i];
 
 		resources[k] = { 0 };
-		old_state[k] = reshade::vulkan::convert_access_to_usage(static_cast<VkAccessFlags>(barrier.srcAccessMask & 0xFFFFFFFF));
-		new_state[k] = reshade::vulkan::convert_access_to_usage(static_cast<VkAccessFlags>(barrier.dstAccessMask & 0xFFFFFFFF));
+		old_state[k] = reshade::vulkan::convert_access_to_usage(barrier.srcAccessMask);
+		new_state[k] = reshade::vulkan::convert_access_to_usage(barrier.dstAccessMask);
 	}
 	for (uint32_t i = 0; i < pDependencyInfo->bufferMemoryBarrierCount; ++i, ++k)
 	{
 		const VkBufferMemoryBarrier2 &barrier = pDependencyInfo->pBufferMemoryBarriers[i];
 
 		resources[k] = { (uint64_t)barrier.buffer };
-		old_state[k] = reshade::vulkan::convert_access_to_usage(static_cast<VkAccessFlags>(barrier.srcAccessMask & 0xFFFFFFFF));
-		new_state[k] = reshade::vulkan::convert_access_to_usage(static_cast<VkAccessFlags>(barrier.dstAccessMask & 0xFFFFFFFF));
+		old_state[k] = reshade::vulkan::convert_access_to_usage(barrier.srcAccessMask);
+		new_state[k] = reshade::vulkan::convert_access_to_usage(barrier.dstAccessMask);
 	}
 	for (uint32_t i = 0; i < pDependencyInfo->imageMemoryBarrierCount; ++i, ++k)
 	{
@@ -1370,12 +1411,15 @@ void VKAPI_CALL vkCmdWriteTimestamp2(VkCommandBuffer commandBuffer, VkPipelineSt
 {
 	reshade::vulkan::device_impl *const device_impl = g_vulkan_devices.at(dispatch_key_from_handle(commandBuffer));
 
-#if RESHADE_ADDON && !RESHADE_ADDON_LITE
-	reshade::vulkan::command_list_impl *const cmd_impl = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_COMMAND_BUFFER>(commandBuffer);
-	assert(device_impl->get_private_data_for_object<VK_OBJECT_TYPE_QUERY_POOL>(queryPool)->type == VK_QUERY_TYPE_TIMESTAMP);
+#if RESHADE_ADDON >= 2
+	if (reshade::has_addon_event<reshade::addon_event::end_query>())
+	{
+		reshade::vulkan::command_list_impl *const cmd_impl = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_COMMAND_BUFFER>(commandBuffer);
+		assert(device_impl->get_private_data_for_object<VK_OBJECT_TYPE_QUERY_POOL>(queryPool)->type == VK_QUERY_TYPE_TIMESTAMP);
 
-	if (reshade::invoke_addon_event<reshade::addon_event::end_query>(cmd_impl, reshade::api::query_pool { (uint64_t)queryPool }, reshade::api::query_type::timestamp, query))
-		return;
+		if (reshade::invoke_addon_event<reshade::addon_event::end_query>(cmd_impl, reshade::api::query_heap { (uint64_t)queryPool }, reshade::api::query_type::timestamp, query))
+			return;
+	}
 #endif
 
 	GET_DISPATCH_PTR_FROM(CmdWriteTimestamp2, device_impl);
@@ -1387,7 +1431,7 @@ void VKAPI_CALL vkCmdCopyBuffer2(VkCommandBuffer commandBuffer, const VkCopyBuff
 	reshade::vulkan::device_impl *const device_impl = g_vulkan_devices.at(dispatch_key_from_handle(commandBuffer));
 	GET_DISPATCH_PTR_FROM(CmdCopyBuffer2, device_impl);
 
-#if RESHADE_ADDON && !RESHADE_ADDON_LITE
+#if RESHADE_ADDON >= 2
 	if (reshade::has_addon_event<reshade::addon_event::copy_buffer_region>())
 	{
 		reshade::vulkan::command_list_impl *const cmd_impl = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_COMMAND_BUFFER>(commandBuffer);
@@ -1402,6 +1446,7 @@ void VKAPI_CALL vkCmdCopyBuffer2(VkCommandBuffer commandBuffer, const VkCopyBuff
 					reshade::api::resource { (uint64_t)pCopyBufferInfo->dstBuffer }, region.dstOffset, region.size))
 				continue;
 
+			// Handle each region separately, so that they can be individually skipped
 			VkCopyBufferInfo2 region_info = *pCopyBufferInfo;
 			region_info.regionCount = 1;
 			region_info.pRegions = &region;
@@ -1418,7 +1463,7 @@ void VKAPI_CALL vkCmdCopyImage2(VkCommandBuffer commandBuffer, const VkCopyImage
 	reshade::vulkan::device_impl *const device_impl = g_vulkan_devices.at(dispatch_key_from_handle(commandBuffer));
 	GET_DISPATCH_PTR_FROM(CmdCopyImage2, device_impl);
 
-#if RESHADE_ADDON && !RESHADE_ADDON_LITE
+#if RESHADE_ADDON >= 2
 	if (reshade::has_addon_event<reshade::addon_event::copy_texture_region>())
 	{
 		reshade::vulkan::command_list_impl *const cmd_impl = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_COMMAND_BUFFER>(commandBuffer);
@@ -1451,6 +1496,7 @@ void VKAPI_CALL vkCmdCopyImage2(VkCommandBuffer commandBuffer, const VkCopyImage
 					reshade::api::filter_mode::min_mag_mip_point))
 				continue;
 
+			// Handle each region separately, so that they can be individually skipped
 			VkCopyImageInfo2 region_info = *pCopyImageInfo;
 			region_info.regionCount = 1;
 			region_info.pRegions = &region;
@@ -1467,7 +1513,7 @@ void VKAPI_CALL vkCmdCopyBufferToImage2(VkCommandBuffer commandBuffer, const VkC
 	reshade::vulkan::device_impl *const device_impl = g_vulkan_devices.at(dispatch_key_from_handle(commandBuffer));
 	GET_DISPATCH_PTR_FROM(CmdCopyBufferToImage2, device_impl);
 
-#if RESHADE_ADDON && !RESHADE_ADDON_LITE
+#if RESHADE_ADDON >= 2
 	if (reshade::has_addon_event<reshade::addon_event::copy_buffer_to_texture>())
 	{
 		reshade::vulkan::command_list_impl *const cmd_impl = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_COMMAND_BUFFER>(commandBuffer);
@@ -1507,7 +1553,7 @@ void VKAPI_CALL vkCmdCopyImageToBuffer2(VkCommandBuffer commandBuffer, const VkC
 	reshade::vulkan::device_impl *const device_impl = g_vulkan_devices.at(dispatch_key_from_handle(commandBuffer));
 	GET_DISPATCH_PTR_FROM(CmdCopyImageToBuffer2, device_impl);
 
-#if RESHADE_ADDON && !RESHADE_ADDON_LITE
+#if RESHADE_ADDON >= 2
 	if (reshade::has_addon_event<reshade::addon_event::copy_texture_to_buffer>())
 	{
 		reshade::vulkan::command_list_impl *const cmd_impl = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_COMMAND_BUFFER>(commandBuffer);
@@ -1547,7 +1593,7 @@ void VKAPI_CALL vkCmdBlitImage2(VkCommandBuffer commandBuffer, const VkBlitImage
 	reshade::vulkan::device_impl *const device_impl = g_vulkan_devices.at(dispatch_key_from_handle(commandBuffer));
 	GET_DISPATCH_PTR_FROM(CmdBlitImage2, device_impl);
 
-#if RESHADE_ADDON && !RESHADE_ADDON_LITE
+#if RESHADE_ADDON >= 2
 	if (reshade::has_addon_event<reshade::addon_event::copy_texture_region>())
 	{
 		reshade::vulkan::command_list_impl *const cmd_impl = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_COMMAND_BUFFER>(commandBuffer);
@@ -1596,7 +1642,7 @@ void VKAPI_CALL vkCmdResolveImage2(VkCommandBuffer commandBuffer, const VkResolv
 	reshade::vulkan::device_impl *const device_impl = g_vulkan_devices.at(dispatch_key_from_handle(commandBuffer));
 	GET_DISPATCH_PTR_FROM(CmdResolveImage2, device_impl);
 
-#if RESHADE_ADDON && !RESHADE_ADDON_LITE
+#if RESHADE_ADDON >= 2
 	if (reshade::has_addon_event<reshade::addon_event::resolve_texture_region>())
 	{
 		reshade::vulkan::command_list_impl *const cmd_impl = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_COMMAND_BUFFER>(commandBuffer);
@@ -1640,6 +1686,8 @@ void VKAPI_CALL vkCmdBeginRendering(VkCommandBuffer commandBuffer, const VkRende
 	const auto cmd_impl = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_COMMAND_BUFFER>(commandBuffer);
 
 	invoke_begin_render_pass_event(cmd_impl, pRenderingInfo);
+
+	cmd_impl->_is_in_render_pass = true;
 #endif
 
 	GET_DISPATCH_PTR_FROM(CmdBeginRendering, device_impl);
@@ -1656,6 +1704,8 @@ void VKAPI_CALL vkCmdEndRendering(VkCommandBuffer commandBuffer)
 
 	std::memset(cmd_impl->current_color_attachments, 0, sizeof(cmd_impl->current_color_attachments));
 	cmd_impl->current_depth_stencil_attachment = VK_NULL_HANDLE;
+
+	cmd_impl->_is_in_render_pass = false;
 #endif
 
 	GET_DISPATCH_PTR_FROM(CmdEndRendering, device_impl);
@@ -1669,13 +1719,11 @@ void VKAPI_CALL vkCmdBindVertexBuffers2(VkCommandBuffer commandBuffer, uint32_t 
 	GET_DISPATCH_PTR_FROM(CmdBindVertexBuffers2, device_impl);
 	trampoline(commandBuffer, firstBinding, bindingCount, pBuffers, pOffsets, pSizes, pStrides);
 
-#if RESHADE_ADDON && !RESHADE_ADDON_LITE
+#if RESHADE_ADDON >= 2
 	if (!reshade::has_addon_event<reshade::addon_event::bind_vertex_buffers>())
 		return;
 
 	reshade::vulkan::command_list_impl *const cmd_impl = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_COMMAND_BUFFER>(commandBuffer);
-
-	static_assert(sizeof(*pBuffers) == sizeof(reshade::api::resource));
 
 	temp_mem<uint32_t> strides_32(bindingCount);
 	for (uint32_t i = 0; i < bindingCount; ++i)
@@ -1696,7 +1744,7 @@ void VKAPI_CALL vkCmdPushDescriptorSetKHR(VkCommandBuffer commandBuffer, VkPipel
 	GET_DISPATCH_PTR_FROM(CmdPushDescriptorSetKHR, device_impl);
 	trampoline(commandBuffer, pipelineBindPoint, layout, set, descriptorWriteCount, pDescriptorWrites);
 
-#if RESHADE_ADDON && !RESHADE_ADDON_LITE
+#if RESHADE_ADDON >= 2
 	if (!reshade::has_addon_event<reshade::addon_event::push_descriptors>())
 		return;
 
@@ -1716,8 +1764,8 @@ void VKAPI_CALL vkCmdPushDescriptorSetKHR(VkCommandBuffer commandBuffer, VkPipel
 	{
 		const VkWriteDescriptorSet &write = pDescriptorWrites[i];
 
-		reshade::api::descriptor_set_update update;
-		update.set = { 0 };
+		reshade::api::descriptor_table_update update;
+		update.table = { 0 };
 		update.binding = write.dstBinding;
 		update.array_offset = write.dstArrayElement;
 		update.count = write.descriptorCount;
@@ -1728,7 +1776,7 @@ void VKAPI_CALL vkCmdPushDescriptorSetKHR(VkCommandBuffer commandBuffer, VkPipel
 		{
 		case VK_DESCRIPTOR_TYPE_SAMPLER:
 			for (uint32_t k = 0; k < write.descriptorCount; ++k, ++j)
-				descriptors[j + 0] = (uint64_t)write.pImageInfo[k].sampler;
+				descriptors[j] = (uint64_t)write.pImageInfo[k].sampler;
 			break;
 		case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
 			for (uint32_t k = 0; k < write.descriptorCount; ++k, j += 2)
@@ -1738,12 +1786,29 @@ void VKAPI_CALL vkCmdPushDescriptorSetKHR(VkCommandBuffer commandBuffer, VkPipel
 		case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
 		case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
 			for (uint32_t k = 0; k < write.descriptorCount; ++k, ++j)
-				descriptors[j + 0] = (uint64_t)write.pImageInfo[k].imageView;
+				descriptors[j] = (uint64_t)write.pImageInfo[k].imageView;
+			break;
+		case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
+		case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
+			for (uint32_t k = 0; k < write.descriptorCount; ++k, ++j)
+				descriptors[j] = (uint64_t)write.pTexelBufferView[k];
 			break;
 		case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
 		case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
 			static_assert(sizeof(reshade::api::buffer_range) == sizeof(VkDescriptorBufferInfo));
 			update.descriptors = write.pBufferInfo;
+			break;
+		case VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR:
+			if (const auto write_acceleration_structure = find_in_structure_chain<VkWriteDescriptorSetAccelerationStructureKHR>(write.pNext, VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR))
+			{
+				assert(update.count == write_acceleration_structure->accelerationStructureCount);
+				update.descriptors = write_acceleration_structure->pAccelerationStructures;
+			}
+			else
+			{
+				update.count = 0;
+				update.descriptors = nullptr;
+			}
 			break;
 		}
 
@@ -1764,13 +1829,11 @@ void VKAPI_CALL vkCmdBindTransformFeedbackBuffersEXT(VkCommandBuffer commandBuff
 	GET_DISPATCH_PTR_FROM(CmdBindTransformFeedbackBuffersEXT, device_impl);
 	trampoline(commandBuffer, firstBinding, bindingCount, pBuffers, pOffsets, pSizes);
 
-#if RESHADE_ADDON && !RESHADE_ADDON_LITE
+#if RESHADE_ADDON >= 2
 	if (!reshade::has_addon_event<reshade::addon_event::bind_stream_output_buffers>())
 		return;
 
 	reshade::vulkan::command_list_impl *const cmd_impl = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_COMMAND_BUFFER>(commandBuffer);
-
-	static_assert(sizeof(*pBuffers) == sizeof(reshade::api::resource));
 
 	reshade::invoke_addon_event<reshade::addon_event::bind_stream_output_buffers>(
 		cmd_impl, firstBinding, bindingCount, reinterpret_cast<const reshade::api::resource *>(pBuffers), pOffsets, pSizes, nullptr, nullptr);
@@ -1781,13 +1844,15 @@ void VKAPI_CALL vkCmdBeginQueryIndexedEXT(VkCommandBuffer commandBuffer, VkQuery
 {
 	reshade::vulkan::device_impl *const device_impl = g_vulkan_devices.at(dispatch_key_from_handle(commandBuffer));
 
-#if RESHADE_ADDON && !RESHADE_ADDON_LITE
-	reshade::vulkan::command_list_impl *const cmd_impl = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_COMMAND_BUFFER>(commandBuffer);
-	const auto pool_data = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_QUERY_POOL>(queryPool);
+#if RESHADE_ADDON >= 2
+	if (reshade::has_addon_event<reshade::addon_event::begin_query>())
+	{
+		reshade::vulkan::command_list_impl *const cmd_impl = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_COMMAND_BUFFER>(commandBuffer);
+		const auto pool_data = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_QUERY_POOL>(queryPool);
 
-	if (reshade::invoke_addon_event<reshade::addon_event::begin_query>(
-			cmd_impl, reshade::api::query_pool { (uint64_t)queryPool }, reshade::vulkan::convert_query_type(pool_data->type, index), query))
-		return;
+		if (reshade::invoke_addon_event<reshade::addon_event::begin_query>(cmd_impl, reshade::api::query_heap { (uint64_t)queryPool }, reshade::vulkan::convert_query_type(pool_data->type, index), query))
+			return;
+	}
 #endif
 
 	GET_DISPATCH_PTR_FROM(CmdBeginQueryIndexedEXT, device_impl);
@@ -1797,15 +1862,187 @@ void VKAPI_CALL vkCmdEndQueryIndexedEXT(VkCommandBuffer commandBuffer, VkQueryPo
 {
 	reshade::vulkan::device_impl *const device_impl = g_vulkan_devices.at(dispatch_key_from_handle(commandBuffer));
 
-#if RESHADE_ADDON && !RESHADE_ADDON_LITE
-	reshade::vulkan::command_list_impl *const cmd_impl = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_COMMAND_BUFFER>(commandBuffer);
-	const auto pool_data = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_QUERY_POOL>(queryPool);
+#if RESHADE_ADDON >= 2
+	if (reshade::has_addon_event<reshade::addon_event::end_query>())
+	{
+		reshade::vulkan::command_list_impl *const cmd_impl = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_COMMAND_BUFFER>(commandBuffer);
+		const auto pool_data = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_QUERY_POOL>(queryPool);
 
-	if (reshade::invoke_addon_event<reshade::addon_event::end_query>(
-			cmd_impl, reshade::api::query_pool { (uint64_t)queryPool }, reshade::vulkan::convert_query_type(pool_data->type, index), query))
-		return;
+		if (reshade::invoke_addon_event<reshade::addon_event::end_query>(cmd_impl, reshade::api::query_heap { (uint64_t)queryPool }, reshade::vulkan::convert_query_type(pool_data->type, index), query))
+			return;
+	}
 #endif
 
 	GET_DISPATCH_PTR_FROM(CmdEndQueryIndexedEXT, device_impl);
 	trampoline(commandBuffer, queryPool, query, index);
+}
+
+void VKAPI_CALL vkCmdBuildAccelerationStructuresKHR(VkCommandBuffer commandBuffer, uint32_t infoCount, const VkAccelerationStructureBuildGeometryInfoKHR *pInfos, const VkAccelerationStructureBuildRangeInfoKHR *const *ppBuildRangeInfos)
+{
+	assert(pInfos != nullptr && ppBuildRangeInfos != nullptr);
+
+	reshade::vulkan::device_impl *const device_impl = g_vulkan_devices.at(dispatch_key_from_handle(commandBuffer));
+	GET_DISPATCH_PTR_FROM(CmdBuildAccelerationStructuresKHR, device_impl);
+
+#if RESHADE_ADDON >= 2
+	if (reshade::has_addon_event<reshade::addon_event::build_acceleration_structure>())
+	{
+		reshade::vulkan::command_list_impl *const cmd_impl = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_COMMAND_BUFFER>(commandBuffer);
+
+		for (uint32_t i = 0; i < infoCount; ++i)
+		{
+			const VkAccelerationStructureBuildGeometryInfoKHR &info = pInfos[i];
+			const VkAccelerationStructureBuildRangeInfoKHR *const range_infos = ppBuildRangeInfos[i];
+
+			std::vector<reshade::api::acceleration_structure_build_input> build_inputs;
+			build_inputs.reserve(info.geometryCount);
+			for (uint32_t k = 0; k < info.geometryCount; ++k)
+				build_inputs.push_back(reshade::vulkan::convert_acceleration_structure_build_input(info.ppGeometries != nullptr ? *info.ppGeometries[k] : info.pGeometries[k], range_infos[k]));
+
+			if (reshade::invoke_addon_event<reshade::addon_event::build_acceleration_structure>(
+					cmd_impl,
+					reshade::vulkan::convert_acceleration_structure_type(info.type),
+					reshade::vulkan::convert_acceleration_structure_build_flags(info.flags),
+					static_cast<uint32_t>(build_inputs.size()),
+					build_inputs.data(),
+					reshade::api::resource {},
+					info.scratchData.deviceAddress,
+					reshade::api::resource_view { (uint64_t)info.srcAccelerationStructure },
+					reshade::api::resource_view { (uint64_t)info.dstAccelerationStructure },
+					static_cast<reshade::api::acceleration_structure_build_mode>(info.mode)))
+				continue;
+
+			// Handle each build info separately, so that they can be individually skipped
+			trampoline(commandBuffer, 1, &info, &range_infos);
+		}
+	}
+	else
+#endif
+	trampoline(commandBuffer, infoCount, pInfos, ppBuildRangeInfos);
+}
+void VKAPI_CALL vkCmdBuildAccelerationStructuresIndirectKHR(VkCommandBuffer commandBuffer, uint32_t infoCount, const VkAccelerationStructureBuildGeometryInfoKHR *pInfos, const VkDeviceAddress *pIndirectDeviceAddresses, const uint32_t *pIndirectStrides, const uint32_t *const *ppMaxPrimitiveCounts)
+{
+	reshade::vulkan::device_impl *const device_impl = g_vulkan_devices.at(dispatch_key_from_handle(commandBuffer));
+
+	GET_DISPATCH_PTR_FROM(CmdBuildAccelerationStructuresIndirectKHR, device_impl);
+	trampoline(commandBuffer, infoCount, pInfos, pIndirectDeviceAddresses, pIndirectStrides, ppMaxPrimitiveCounts);
+}
+
+void VKAPI_CALL vkCmdCopyAccelerationStructureKHR(VkCommandBuffer commandBuffer, const VkCopyAccelerationStructureInfoKHR *pInfo)
+{
+	assert(pInfo != nullptr);
+
+	reshade::vulkan::device_impl *const device_impl = g_vulkan_devices.at(dispatch_key_from_handle(commandBuffer));
+
+#if RESHADE_ADDON >= 2
+	reshade::vulkan::command_list_impl *const cmd_impl = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_COMMAND_BUFFER>(commandBuffer);
+
+	if (reshade::invoke_addon_event<reshade::addon_event::copy_acceleration_structure>(
+			cmd_impl,
+			reshade::api::resource_view { (uint64_t)pInfo->src },
+			reshade::api::resource_view { (uint64_t)pInfo->dst },
+			reshade::vulkan::convert_acceleration_structure_copy_mode(pInfo->mode)))
+		return;
+#endif
+
+	GET_DISPATCH_PTR_FROM(CmdCopyAccelerationStructureKHR, device_impl);
+	trampoline(commandBuffer, pInfo);
+}
+
+void VKAPI_CALL vkCmdTraceRaysKHR(VkCommandBuffer commandBuffer, const VkStridedDeviceAddressRegionKHR *pRaygenShaderBindingTable, const VkStridedDeviceAddressRegionKHR *pMissShaderBindingTable, const VkStridedDeviceAddressRegionKHR *pHitShaderBindingTable, const VkStridedDeviceAddressRegionKHR *pCallableShaderBindingTable, uint32_t width, uint32_t height, uint32_t depth)
+{
+	assert(pRaygenShaderBindingTable != nullptr && pMissShaderBindingTable != nullptr && pHitShaderBindingTable != nullptr && pCallableShaderBindingTable != nullptr);
+
+	reshade::vulkan::device_impl *const device_impl = g_vulkan_devices.at(dispatch_key_from_handle(commandBuffer));
+
+#if RESHADE_ADDON
+	reshade::vulkan::command_list_impl *const cmd_impl = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_COMMAND_BUFFER>(commandBuffer);
+
+	if (reshade::invoke_addon_event<reshade::addon_event::dispatch_rays>(
+			cmd_impl,
+			reshade::api::resource {},
+			pRaygenShaderBindingTable->deviceAddress,
+			pRaygenShaderBindingTable->size,
+			reshade::api::resource {},
+			pMissShaderBindingTable->deviceAddress,
+			pMissShaderBindingTable->size,
+			pMissShaderBindingTable->stride,
+			reshade::api::resource {},
+			pHitShaderBindingTable->deviceAddress,
+			pHitShaderBindingTable->size,
+			pHitShaderBindingTable->stride,
+			reshade::api::resource {},
+			pCallableShaderBindingTable->deviceAddress,
+			pCallableShaderBindingTable->size,
+			pCallableShaderBindingTable->stride,
+			width, height, depth))
+		return;
+#endif
+
+	GET_DISPATCH_PTR_FROM(CmdTraceRaysKHR, device_impl);
+	trampoline(commandBuffer, pRaygenShaderBindingTable, pMissShaderBindingTable, pHitShaderBindingTable, pCallableShaderBindingTable, width, height, depth);
+}
+void VKAPI_CALL vkCmdTraceRaysIndirectKHR(VkCommandBuffer commandBuffer, const VkStridedDeviceAddressRegionKHR *pRaygenShaderBindingTable, const VkStridedDeviceAddressRegionKHR *pMissShaderBindingTable, const VkStridedDeviceAddressRegionKHR *pHitShaderBindingTable, const VkStridedDeviceAddressRegionKHR *pCallableShaderBindingTable, VkDeviceAddress indirectDeviceAddress)
+{
+	reshade::vulkan::device_impl *const device_impl = g_vulkan_devices.at(dispatch_key_from_handle(commandBuffer));
+
+	GET_DISPATCH_PTR_FROM(CmdTraceRaysIndirectKHR, device_impl);
+	trampoline(commandBuffer, pRaygenShaderBindingTable, pMissShaderBindingTable, pHitShaderBindingTable, pCallableShaderBindingTable, indirectDeviceAddress);
+}
+void VKAPI_CALL vkCmdTraceRaysIndirect2KHR(VkCommandBuffer commandBuffer, VkDeviceAddress indirectDeviceAddress)
+{
+	reshade::vulkan::device_impl *const device_impl = g_vulkan_devices.at(dispatch_key_from_handle(commandBuffer));
+
+#if RESHADE_ADDON
+	reshade::vulkan::command_list_impl *const cmd_impl = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_COMMAND_BUFFER>(commandBuffer);
+
+	if (reshade::invoke_addon_event<reshade::addon_event::draw_or_dispatch_indirect>(cmd_impl, reshade::api::indirect_command::dispatch_rays, reshade::api::resource {}, indirectDeviceAddress, 1, 0))
+		return;
+#endif
+
+	GET_DISPATCH_PTR_FROM(CmdTraceRaysIndirect2KHR, device_impl);
+	trampoline(commandBuffer, indirectDeviceAddress);
+}
+
+void VKAPI_CALL vkCmdDrawMeshTasksEXT(VkCommandBuffer commandBuffer, uint32_t groupCountX, uint32_t groupCountY, uint32_t groupCountZ)
+{
+	reshade::vulkan::device_impl *const device_impl = g_vulkan_devices.at(dispatch_key_from_handle(commandBuffer));
+
+#if RESHADE_ADDON
+	reshade::vulkan::command_list_impl *const cmd_impl = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_COMMAND_BUFFER>(commandBuffer);
+
+	if (reshade::invoke_addon_event<reshade::addon_event::dispatch_mesh>(cmd_impl, groupCountX, groupCountY, groupCountZ))
+		return;
+#endif
+
+	GET_DISPATCH_PTR_FROM(CmdDrawMeshTasksEXT, device_impl);
+	trampoline(commandBuffer, groupCountX, groupCountY, groupCountZ);
+}
+void VKAPI_CALL vkCmdDrawMeshTasksIndirectEXT(VkCommandBuffer commandBuffer, VkBuffer buffer, VkDeviceSize offset, uint32_t drawCount, uint32_t stride)
+{
+	reshade::vulkan::device_impl *const device_impl = g_vulkan_devices.at(dispatch_key_from_handle(commandBuffer));
+
+#if RESHADE_ADDON
+	reshade::vulkan::command_list_impl *const cmd_impl = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_COMMAND_BUFFER>(commandBuffer);
+
+	if (reshade::invoke_addon_event<reshade::addon_event::draw_or_dispatch_indirect>(cmd_impl, reshade::api::indirect_command::dispatch_mesh, reshade::api::resource { (uint64_t)buffer }, offset, drawCount, stride))
+		return;
+#endif
+
+	GET_DISPATCH_PTR_FROM(CmdDrawMeshTasksIndirectEXT, device_impl);
+	trampoline(commandBuffer, buffer, offset, drawCount, stride);
+}
+void VKAPI_CALL vkCmdDrawMeshTasksIndirectCountEXT(VkCommandBuffer commandBuffer, VkBuffer buffer, VkDeviceSize offset, VkBuffer countBuffer, VkDeviceSize countBufferOffset, uint32_t maxDrawCount, uint32_t stride)
+{
+	reshade::vulkan::device_impl *const device_impl = g_vulkan_devices.at(dispatch_key_from_handle(commandBuffer));
+
+#if RESHADE_ADDON
+	reshade::vulkan::command_list_impl *const cmd_impl = device_impl->get_private_data_for_object<VK_OBJECT_TYPE_COMMAND_BUFFER>(commandBuffer);
+
+	if (reshade::invoke_addon_event<reshade::addon_event::draw_or_dispatch_indirect>(cmd_impl, reshade::api::indirect_command::dispatch_mesh, reshade::api::resource { (uint64_t)buffer }, offset, maxDrawCount, stride))
+		return;
+#endif
+
+	GET_DISPATCH_PTR_FROM(CmdDrawMeshTasksIndirectCountEXT, device_impl);
+	trampoline(commandBuffer, buffer, offset, countBuffer, countBufferOffset, maxDrawCount, stride);
 }

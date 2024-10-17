@@ -14,16 +14,10 @@ extern std::filesystem::path g_reshade_dll_path;
 extern std::filesystem::path g_reshade_base_path;
 extern std::filesystem::path g_target_executable_path;
 
-inline void trim(std::string &str, const char chars[] = " \t")
+inline std::string_view trim(std::string_view str, const char chars[] = " \t")
 {
-	str.erase(0, str.find_first_not_of(chars));
-	str.erase(str.find_last_not_of(chars) + 1);
-}
-inline std::string trim(const std::string &str, const char chars[] = " \t")
-{
-	std::string res(str);
-	trim(res, chars);
-	return res;
+	const size_t first = str.find_first_not_of(chars);
+	return first != std::string_view::npos ? std::string_view(str.data() + first, str.find_last_not_of(chars) + 1 - first) : std::string_view();
 }
 
 class ini_file
@@ -96,6 +90,27 @@ public:
 		values.resize(it2->second.size());
 		for (size_t i = 0; i < it2->second.size(); ++i)
 			values[i] = convert<T>(it2->second, i);
+		return true;
+	}
+	template <>
+	bool get(const std::string &section, const std::string &key, std::vector<std::pair<std::string, std::string>> &values) const
+	{
+		const auto it1 = _sections.find(section);
+		if (it1 == _sections.end())
+			return false;
+		const auto it2 = it1->second.find(key);
+		if (it2 == it1->second.end())
+			return false;
+		values.resize(it2->second.size());
+		for (size_t i = 0; i < it2->second.size(); ++i)
+		{
+			std::string value = convert<std::string>(it2->second, i);
+			if (const size_t equals_sign = value.find('=');
+				equals_sign != std::string::npos)
+				values[i] = { value.substr(0, equals_sign), value.substr(equals_sign + 1) };
+			else
+				values[i].first = std::move(value);
+		}
 		return true;
 	}
 
@@ -180,6 +195,21 @@ public:
 		_modified_at = std::filesystem::file_time_type::clock::now();
 	}
 	template <>
+	void set(const std::string &section, const std::string &key, const std::vector<std::pair<std::string, std::string>> &values)
+	{
+		auto &v = _sections[section][key];
+		v.resize(values.size());
+		for (size_t i = 0; i < values.size(); ++i)
+		{
+			const std::pair<std::string, std::string> &value = values[i];
+			v[i] = value.first;
+			if (!value.second.empty())
+				v[i] += '=' + value.second;
+		}
+		_modified = true;
+		_modified_at = std::filesystem::file_time_type::clock::now();
+	}
+	template <>
 	void set(const std::string &section, const std::string &key, const std::vector<std::filesystem::path> &values)
 	{
 		auto &v = _sections[section][key];
@@ -229,20 +259,20 @@ public:
 	/// Saves all changes to INI files that were loaded through <see cref="load_cache"/> to disk.
 	/// </summary>
 	static bool flush_cache();
-	static bool flush_cache(const std::filesystem::path &path);
+	static bool flush_cache(std::filesystem::path path);
 
 	/// <summary>
 	/// Removes all INI files from cache, without saving changes.
 	/// </summary>
 	static void clear_cache();
-	static void clear_cache(const std::filesystem::path &path);
+	static void clear_cache(std::filesystem::path path);
 
 	/// <summary>
 	/// Gets the specified INI file from cache or opens it when it was not cached yet.
 	/// </summary>
 	/// <param name="path">Path to the INI file to access.</param>
 	/// <returns>Reference to the cached data.</returns>
-	static ini_file &load_cache(const std::filesystem::path &path);
+	static ini_file &load_cache(std::filesystem::path path);
 
 private:
 	template <typename T>

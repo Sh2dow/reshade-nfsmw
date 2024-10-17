@@ -6,13 +6,15 @@
  * Heavily modified fork of https://github.com/BalazsJako/ImGuiColorTextEdit
  */
 
-#include "effect_lexer.hpp"
 #include "imgui_code_editor.hpp"
+#include <cmath> // std::abs, std::floor, std::fmod
+#include <cctype> // std::isblank, std::tolower
+#include <cstdio> // std::snprintf
+#include <algorithm> // std::max, std::min
+#include <utf8/unchecked.h>
 #include <imgui.h>
-#include <imgui_internal.h> // GetCurrentWindowRead
-#include <algorithm>
 
-static inline int get_parenthesis_type(char c)
+static int get_parenthesis_type(utf8::utfchar32_t c)
 {
 	switch (c)
 	{
@@ -87,7 +89,7 @@ const char *reshade::imgui::code_editor::get_palette_color_name(unsigned int col
 }
 
 // 'ImGui::CalcTextSize' cancels out character spacing at the end, but we do not want that, hence the custom function
-static inline ImVec2 calc_text_size(const char *text, const char *text_end = nullptr)
+static ImVec2 calc_text_size(const char *text, const char *text_end = nullptr)
 {
 	return ImGui::GetFont()->CalcTextSizeA(ImGui::GetFontSize(), FLT_MAX, -1.0f, text, text_end, nullptr);
 }
@@ -111,22 +113,36 @@ void reshade::imgui::code_editor::render(const char *title, const uint32_t palet
 	ImGui::PushStyleColor(ImGuiCol_ChildBg, ImGui::ColorConvertU32ToFloat4(palette[color_background]));
 	ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0.0f, 0.0f));
 
-	ImGui::BeginChild(title, ImVec2(0, _search_window_open * -bottom_height), border, ImGuiWindowFlags_HorizontalScrollbar | ImGuiWindowFlags_AlwaysHorizontalScrollbar | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoNavInputs);
-	ImGui::PushAllowKeyboardFocus(true);
-	const char *const editor_window_name = ImGui::GetCurrentWindowRead()->Name;
+	ImGuiIO &io = ImGui::GetIO();
+	const bool ctrl = io.KeyCtrl, shift = io.KeyShift, alt = io.KeyAlt;
+
+	const bool open_search_window = ctrl && !shift && !alt && (ImGui::IsKeyPressed(ImGuiKey_F) || ImGui::IsKeyPressed(ImGuiKey_H));
+	if (open_search_window)
+	{
+		// Copy currently selected text into search box
+		if (_select_beg != _select_end)
+			_search_text[get_selected_text().copy(_search_text, sizeof(_search_text) - 1)] = '\0';
+
+		_search_window_open = ImGui::IsKeyPressed(ImGuiKey_H) ? 2 /* search + replace */ : 1 /* search */;
+	}
+	else if (_search_window_open < 0)
+	{
+		_search_window_open = 0;
+		ImGui::SetNextWindowFocus();
+	}
+
+	ImGui::BeginChild(title, ImVec2(0, _search_window_open * -bottom_height), border ? ImGuiChildFlags_Border : ImGuiChildFlags_None, ImGuiWindowFlags_HorizontalScrollbar | ImGuiWindowFlags_AlwaysHorizontalScrollbar | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoNavInputs);
+	ImGui::PushTabStop(true);
 
 	char buf[128] = "", *buf_end = buf;
 
 	// Deduce text start offset by evaluating maximum number of lines plus two spaces as text width
-	snprintf(buf, 16, " %zu ", _lines.size());
+	std::snprintf(buf, 16, " %zu ", _lines.size());
 	const float text_start = ImGui::CalcTextSize(buf).x + _left_margin;
 	// The following holds the approximate width and height of a default character for offset calculation
 	const ImVec2 char_advance = ImVec2(calc_text_size(" ").x, ImGui::GetTextLineHeightWithSpacing() * _line_spacing);
 
-	ImGuiIO &io = ImGui::GetIO();
 	_cursor_anim += io.DeltaTime;
-
-	const bool ctrl = io.KeyCtrl, shift = io.KeyShift, alt = io.KeyAlt;
 
 	// Handle keyboard input
 	if (ImGui::IsWindowFocused())
@@ -137,60 +153,60 @@ void reshade::imgui::code_editor::render(const char *title, const uint32_t palet
 		io.WantTextInput = true;
 		io.WantCaptureKeyboard = true;
 
-		if (ImGui::IsKeyPressedMap(ImGuiKey_Escape))
+		if (ImGui::IsKeyPressed(ImGuiKey_Escape))
 			ImGui::SetWindowFocus(nullptr); // Reset window focus
-		else if (ctrl && !shift && !alt && ImGui::IsKeyPressedMap(ImGuiKey_Z))
+		else if (ctrl && !shift && !alt && ImGui::IsKeyPressed(ImGuiKey_Z))
 			undo();
-		else if (ctrl && !shift && !alt && ImGui::IsKeyPressedMap(ImGuiKey_Y))
+		else if (ctrl && !shift && !alt && ImGui::IsKeyPressed(ImGuiKey_Y))
 			redo();
-		else if (!ctrl && ImGui::IsKeyPressedMap(ImGuiKey_UpArrow))
+		else if (!ctrl && ImGui::IsKeyPressed(ImGuiKey_UpArrow))
 			if (alt && !shift) // Alt + Up moves the current line one up
 				move_lines_up();
 			else
 				move_up(1, shift);
-		else if (!ctrl && ImGui::IsKeyPressedMap(ImGuiKey_DownArrow))
+		else if (!ctrl && ImGui::IsKeyPressed(ImGuiKey_DownArrow))
 			if (alt && !shift) // Alt + Down moves the current line one down
 				move_lines_down();
 			else
 				move_down(1, shift);
-		else if (!alt && ImGui::IsKeyPressedMap(ImGuiKey_LeftArrow))
+		else if (!alt && ImGui::IsKeyPressed(ImGuiKey_LeftArrow))
 			move_left(1, shift, ctrl);
-		else if (!alt && ImGui::IsKeyPressedMap(ImGuiKey_RightArrow))
+		else if (!alt && ImGui::IsKeyPressed(ImGuiKey_RightArrow))
 			move_right(1, shift, ctrl);
-		else if (!alt && ImGui::IsKeyPressedMap(ImGuiKey_PageUp))
+		else if (!alt && ImGui::IsKeyPressed(ImGuiKey_PageUp))
 			move_up(static_cast<size_t>(floor((ImGui::GetWindowHeight() - 20.0f) / char_advance.y) - 4.0f), shift);
-		else if (!alt && ImGui::IsKeyPressedMap(ImGuiKey_PageDown))
+		else if (!alt && ImGui::IsKeyPressed(ImGuiKey_PageDown))
 			move_down(static_cast<size_t>(floor((ImGui::GetWindowHeight() - 20.0f) / char_advance.y) - 4.0f), shift);
-		else if (!alt && ImGui::IsKeyPressedMap(ImGuiKey_Home))
+		else if (!alt && ImGui::IsKeyPressed(ImGuiKey_Home))
 			if (ctrl)
 				move_top(shift);
 			else
 				move_home(shift);
-		else if (!alt && ImGui::IsKeyPressedMap(ImGuiKey_End))
+		else if (!alt && ImGui::IsKeyPressed(ImGuiKey_End))
 			if (ctrl)
 				move_bottom(shift);
 			else
 				move_end(shift);
-		else if (!ctrl && !shift && !alt && ImGui::IsKeyPressedMap(ImGuiKey_Delete))
+		else if (!ctrl && !shift && !alt && ImGui::IsKeyPressed(ImGuiKey_Delete))
 			delete_next();
-		else if (!ctrl && !shift && !alt && ImGui::IsKeyPressedMap(ImGuiKey_Backspace))
+		else if (!ctrl && !shift && !alt && ImGui::IsKeyPressed(ImGuiKey_Backspace))
 			delete_previous();
-		else if (!alt && ImGui::IsKeyPressedMap(ImGuiKey_Insert))
+		else if (!alt && ImGui::IsKeyPressed(ImGuiKey_Insert))
 			if (ctrl)
 				clipboard_copy();
 			else if (shift)
 				clipboard_paste();
 			else
 				_overwrite ^= true;
-		else if (ctrl && !shift && !alt && ImGui::IsKeyPressedMap(ImGuiKey_C))
+		else if (ctrl && !shift && !alt && ImGui::IsKeyPressed(ImGuiKey_C))
 			clipboard_copy();
-		else if (ctrl && !shift && !alt && ImGui::IsKeyPressedMap(ImGuiKey_V))
+		else if (ctrl && !shift && !alt && ImGui::IsKeyPressed(ImGuiKey_V))
 			clipboard_paste();
-		else if (ctrl && !shift && !alt && ImGui::IsKeyPressedMap(ImGuiKey_X))
+		else if (ctrl && !shift && !alt && ImGui::IsKeyPressed(ImGuiKey_X))
 			clipboard_cut();
-		else if (ctrl && !shift && !alt && ImGui::IsKeyPressedMap(ImGuiKey_A))
+		else if (ctrl && !shift && !alt && ImGui::IsKeyPressed(ImGuiKey_A))
 			select_all();
-		else if (!ctrl && !shift && !alt && ImGui::IsKeyPressedMap(ImGuiKey_Enter))
+		else if (!ctrl && !shift && !alt && ImGui::IsKeyPressed(ImGuiKey_Enter))
 			insert_character('\n', true);
 		else
 			for (ImWchar c : io.InputQueueCharacters)
@@ -205,12 +221,12 @@ void reshade::imgui::code_editor::render(const char *title, const uint32_t palet
 			const ImVec2 pos(ImGui::GetMousePos().x - ImGui::GetCursorScreenPos().x, ImGui::GetMousePos().y - ImGui::GetCursorScreenPos().y);
 
 			text_pos res;
-			res.line = std::max<size_t>(0, static_cast<size_t>(floor(pos.y / char_advance.y)));
-			res.line = std::min<size_t>(res.line, _lines.size() - 1);
+			res.line = std::max(static_cast<size_t>(0), static_cast<size_t>(std::floor(pos.y / char_advance.y)));
+			res.line = std::min(res.line, _lines.size() - 1);
 
 			float column_width = 0.0f;
-			std::string cumulated_string = "";
 			float cumulated_string_width[2] = { 0.0f, 0.0f }; // [0] is the latest, [1] is the previous. I use that trick to check where cursor is exactly (important for tabs).
+			std::string cumulated_string;
 
 			const std::vector<glyph> &line = _lines[res.line];
 
@@ -218,8 +234,8 @@ void reshade::imgui::code_editor::render(const char *title, const uint32_t palet
 			while (text_start + cumulated_string_width[0] < pos.x && res.column < line.size())
 			{
 				cumulated_string_width[1] = cumulated_string_width[0];
-				cumulated_string += line[res.column].c;
-				cumulated_string_width[0] = calc_text_size(cumulated_string.c_str()).x;
+				utf8::unchecked::append(line[res.column].c, std::back_inserter(cumulated_string));
+				cumulated_string_width[0] = calc_text_size(cumulated_string.data(), cumulated_string.data() + cumulated_string.size()).x;
 				column_width = (cumulated_string_width[0] - cumulated_string_width[1]);
 				res.column++;
 			}
@@ -293,7 +309,7 @@ void reshade::imgui::code_editor::render(const char *title, const uint32_t palet
 	// If cursor is on a parenthesis or bracket, find the matching sibling to highlight
 	text_pos parenthesis_pos[2];
 	{
-		char parenthesis_c = 0;
+		utf8::utfchar32_t parenthesis_c = 0;
 		text_pos search_pos = _cursor_pos;
 
 		// Check if character to the right or left of the cursor is a parenthesis or bracket
@@ -340,17 +356,24 @@ void reshade::imgui::code_editor::render(const char *title, const uint32_t palet
 	float longest_line = 0.0f;
 	const float space_size = calc_text_size(" ").x;
 
-	size_t line_no = static_cast<size_t>(floor(ImGui::GetScrollY() / char_advance.y));
-	size_t line_max = std::max<size_t>(0, std::min(_lines.size() - 1, line_no + static_cast<size_t>(floor((ImGui::GetScrollY() + ImGui::GetWindowContentRegionMax().y) / char_advance.y))));
+	size_t line_no = static_cast<size_t>(std::floor(ImGui::GetScrollY() / char_advance.y));
+	size_t line_max = std::max(static_cast<size_t>(0), std::min(_lines.size() - 1, line_no + static_cast<size_t>(std::floor((ImGui::GetScrollY() + ImGui::GetWindowContentRegionMax().y) / char_advance.y))));
 
 	const auto calc_text_distance_to_line_begin = [this, space_size](const text_pos &from) {
 		float distance = 0.0f;
 		const std::vector<glyph> &line = _lines[from.line];
 		for (size_t i = 0u; i < line.size() && i < from.column; ++i)
+		{
 			if (line[i].c == '\t')
+			{
 				distance += _tab_size * space_size;
+			}
 			else
-				distance += calc_text_size(&line[i].c, &line[i].c + 1).x;
+			{
+				char text[4], *text_end = utf8::unchecked::append(line[i].c, text);
+				distance += calc_text_size(text, text_end).x;
+			}
+		}
 		return distance;
 	};
 
@@ -452,7 +475,7 @@ void reshade::imgui::code_editor::render(const char *title, const uint32_t palet
 			if (ImGui::IsMouseHoveringRect(beg, end))
 			{
 				ImGui::BeginTooltip();
-				ImGui::Text("%s", it->second.first.c_str());
+				ImGui::TextUnformatted(it->second.first.c_str());
 				ImGui::EndTooltip();
 			}
 		}
@@ -472,7 +495,7 @@ void reshade::imgui::code_editor::render(const char *title, const uint32_t palet
 			}
 
 			// Draw the cursor animation
-			if (is_focused && io.ConfigInputTextCursorBlink && fmodf(_cursor_anim, 1.0f) <= 0.5f)
+			if (is_focused && io.ConfigInputTextCursorBlink && std::fmod(_cursor_anim, 1.0f) <= 0.5f)
 			{
 				const float cx = calc_text_distance_to_line_begin(_cursor_pos);
 
@@ -484,7 +507,7 @@ void reshade::imgui::code_editor::render(const char *title, const uint32_t palet
 		}
 
 		// Draw line number (right aligned)
-		snprintf(buf, 16, "%zu  ", line_no + 1);
+		std::snprintf(buf, 16, "%zu  ", line_no + 1);
 
 		draw_list->AddText(ImVec2(text_screen_pos.x - ImGui::CalcTextSize(buf).x, line_screen_pos.y), palette[color_line_number], buf);
 
@@ -499,7 +522,7 @@ void reshade::imgui::code_editor::render(const char *title, const uint32_t palet
 		// Fill temporary buffer with glyph characters and commit it every time the color changes or a tab character is encountered
 		for (const glyph &glyph : line)
 		{
-			if (buf != buf_end && (glyph.col != current_color || glyph.c == '\t' || buf_end - buf >= sizeof(buf)))
+			if (buf != buf_end && (glyph.col != current_color || glyph.c == '\t' || buf_end - buf >= sizeof(buf) - 4)) // Up to 4 bytes per unicode code point
 			{
 				draw_list->AddText(ImVec2(text_screen_pos.x + text_offset, text_screen_pos.y), palette[current_color], buf, buf_end);
 
@@ -507,7 +530,7 @@ void reshade::imgui::code_editor::render(const char *title, const uint32_t palet
 			}
 
 			if (glyph.c != '\t')
-				*buf_end++ = glyph.c;
+				buf_end = utf8::unchecked::append(glyph.c, buf_end);
 			else
 				text_offset += _tab_size * space_size;
 
@@ -540,113 +563,89 @@ void reshade::imgui::code_editor::render(const char *title, const uint32_t palet
 		if (len + text_start > (ImGui::GetScrollX() + max_scroll_width - extra_space))
 			ImGui::SetScrollX(std::max(0.0f, len + text_start + extra_space - max_scroll_width));
 
-		if (!_search_window_open) // Focus on search text box instead of the editor window
+		if (_search_window_open == 0) // Focus on search text box instead of the editor window when it is open
 			ImGui::SetWindowFocus();
 
 		_scroll_to_cursor = false;
 	}
 
-	ImGui::PopAllowKeyboardFocus();
+	ImGui::PopTabStop();
 	ImGui::EndChild();
 
 	ImGui::PopStyleVar();
 	ImGui::PopStyleColor();
 	ImGui::PopFont();
 
-	if (ctrl && !shift && !alt && (ImGui::IsKeyPressed('F') || ImGui::IsKeyPressed('H')))
-	{
-		// Copy currently selected text into search box
-		if (_select_beg != _select_end)
-			_search_text[get_selected_text().copy(_search_text, sizeof(_search_text) - 1)] = '\0';
-
-		_search_window_open = ImGui::IsKeyPressed('H') ? 2 /* search + replace */ : 1 /* search */;
-		_search_window_focus = 2; // Need to focus multiple frames (see https://github.com/ocornut/imgui/issues/343)
-	}
-
-	if (_search_window_open)
+	if (_search_window_open > 0)
 	{
 		ImGui::Dummy(ImVec2(0, ImGui::GetStyle().ItemSpacing.y));
 		ImGui::BeginChild("##search", ImVec2(0, 0));
+
+		if (open_search_window)
+			ImGui::SetKeyboardFocusHere();
 
 		const float input_width = ImGui::GetContentRegionAvail().x - (4 * button_spacing) - (4 * button_size) - 5;
 		ImGui::PushItemWidth(input_width);
 		if (ImGui::InputText("##search", _search_text, sizeof(_search_text), ImGuiInputTextFlags_AutoSelectAll | ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_AllowTabInput))
 		{
-			_search_window_focus = 1; // Focus text box again after entering a value
+			ImGui::SetKeyboardFocusHere(-1); // Focus text box again after entering a value
+
 			find_and_scroll_to_text(_search_text);
 		}
 		ImGui::PopItemWidth();
 
-		if (_search_window_focus != 0 && _search_window_focus < 3)
-		{
-			_search_window_focus -= 1;
-			ImGui::SetKeyboardFocusHere(-1);
-		}
-
 		ImGui::SameLine(0.0f, button_spacing);
 		ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyle().Colors[_search_case_sensitive ? ImGuiCol_ButtonActive : ImGuiCol_Button]);
-		if (ImGui::Button("Aa", ImVec2(button_size + 5, 0)) || (!ctrl && !shift && alt && ImGui::IsKeyPressed('C')))
+		if (ImGui::Button("Aa", ImVec2(button_size + 5, 0)) || (!ctrl && !shift && alt && ImGui::IsKeyPressed(ImGuiKey_C)))
 			_search_case_sensitive = !_search_case_sensitive;
 		ImGui::PopStyleColor();
-		if (ImGui::IsItemHovered())
-			ImGui::SetTooltip("Match case (Alt + C)");
+		ImGui::SetItemTooltip("Match case (Alt + C)");
 
 		ImGui::SameLine(0.0f, button_spacing);
-		if (ImGui::Button("<", ImVec2(button_size, 0)) || (shift && ImGui::IsKeyPressed(0x72))) // VK_F3
+		if (ImGui::Button("<", ImVec2(button_size, 0)) || (shift && ImGui::IsKeyPressed(ImGuiKey_F3)))
 			find_and_scroll_to_text(_search_text, true);
-		if (ImGui::IsItemHovered())
-			ImGui::SetTooltip("Find previous (Shift + F3)");
+		ImGui::SetItemTooltip("Find previous (Shift + F3)");
 
 		ImGui::SameLine(0.0f, button_spacing);
-		if (ImGui::Button(">", ImVec2(button_size, 0)) || (!shift && ImGui::IsKeyPressed(0x72)))
+		if (ImGui::Button(">", ImVec2(button_size, 0)) || (!shift && ImGui::IsKeyPressed(ImGuiKey_F3)))
 			find_and_scroll_to_text(_search_text, false);
-		if (ImGui::IsItemHovered())
-			ImGui::SetTooltip("Find next (F3)");
+		ImGui::SetItemTooltip("Find next (F3)");
 
 		ImGui::SameLine(0.0f, button_spacing);
-		if (ImGui::Button("X", ImVec2(button_size, 0)) || ImGui::IsKeyPressedMap(ImGuiKey_Escape))
+		if (ImGui::Button("X", ImVec2(button_size, 0)) || ImGui::IsKeyPressed(ImGuiKey_Escape))
 		{
-			_search_window_open = _search_window_focus = 0;
 			// Move focus back to text editor again next frame
-			ImGui::SetWindowFocus(editor_window_name);
+			_search_window_open = -1;
 		}
-		if (ImGui::IsItemHovered())
-			ImGui::SetTooltip("Close (Escape)");
+		ImGui::SetItemTooltip("Close (Escape)");
 
-		if (_search_window_open != 1)
+		if (_search_window_open > +1)
 		{
 			ImGui::PushItemWidth(input_width);
 			if (ImGui::InputText("##replace", _replace_text, sizeof(_replace_text), ImGuiInputTextFlags_AutoSelectAll | ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_AllowTabInput))
 			{
-				_search_window_focus = 3; // Focus replace text box again after entering a value
+				ImGui::SetKeyboardFocusHere(-1); // Focus replace text box again after entering a value
+
 				if (find_and_scroll_to_text(_search_text, false, true))
 					insert_text(_replace_text);
 			}
 			ImGui::PopItemWidth();
 
-			if (_search_window_focus == 3)
-			{
-				_search_window_focus  = 0;
-				ImGui::SetKeyboardFocusHere(-1);
-			}
-
 			ImGui::SameLine(0.0f, button_spacing * 2 + button_size + 5);
-			if (ImGui::Button("Repl", ImVec2(2 * button_size + button_spacing, 0)) || (!ctrl && !shift && alt && ImGui::IsKeyPressed('R')))
+			if (ImGui::Button("Repl", ImVec2(2 * button_size + button_spacing, 0)) || (!ctrl && !shift && alt && ImGui::IsKeyPressed(ImGuiKey_R)))
 				if (find_and_scroll_to_text(_search_text, false, true))
 					insert_text(_replace_text);
-			if (ImGui::IsItemHovered())
-				ImGui::SetTooltip("Replace next (Alt + R)");
+			ImGui::SetItemTooltip("Replace next (Alt + R)");
 
 			ImGui::SameLine(0.0f, button_spacing);
-			if (ImGui::Button("A", ImVec2(button_size, 0)) || (!ctrl && !shift && alt && ImGui::IsKeyPressed('A')))
+			if (ImGui::Button("A", ImVec2(button_size, 0)) || (!ctrl && !shift && alt && ImGui::IsKeyPressed(ImGuiKey_A)))
 			{
 				// Reset select position so that replace stats at document begin
 				_select_beg = text_pos();
 				while (find_and_scroll_to_text(_search_text, false, true))
 					insert_text(_replace_text);
 			}
-			if (ImGui::IsItemHovered())
-				ImGui::SetTooltip("Replace all (Alt + A)");
+			ImGui::SetItemTooltip("Replace all (Alt + A)");
 		}
 
 		ImGui::EndChild();
@@ -692,11 +691,34 @@ void reshade::imgui::code_editor::select(const text_pos &beg, const text_pos &en
 	_cursor_anim = 0;
 
 	// Find the identifier under the cursor position
+	_highlighted.clear();
 	text_pos highlight_beg = _select_beg;
 	text_pos highlight_end = _select_end;
 	select_word(highlight_beg, highlight_end);
-	_highlighted = _lines[highlight_beg.line].size() > highlight_beg.column && _lines[highlight_beg.line][highlight_beg.column].col == color_identifier ?
-		get_text(highlight_beg, highlight_end) : std::string();
+	if (_lines[highlight_beg.line].size() > highlight_beg.column && _lines[highlight_beg.line][highlight_beg.column].col == color_identifier)
+	{
+		for (text_pos it = highlight_beg; it < highlight_end;)
+		{
+			const std::vector<glyph> &line = _lines[it.line];
+
+			if (it.column < line.size())
+			{
+				_highlighted.push_back(line[it.column].c);
+
+				it.column++;
+			}
+			else
+			{
+				it.line++;
+				it.column = 0;
+
+				if (it.line < _lines.size())
+					// Reached end of line, so append a new line feed
+					_highlighted.push_back('\n');
+			}
+		}
+
+	}
 
 	switch (mode)
 	{
@@ -724,7 +746,7 @@ void reshade::imgui::code_editor::select_all()
 	select(_interactive_beg, _interactive_end);
 }
 
-void reshade::imgui::code_editor::set_text(const std::string &text)
+void reshade::imgui::code_editor::set_text(const std::string_view text)
 {
 	_lines.clear();
 	_lines.emplace_back();
@@ -734,8 +756,12 @@ void reshade::imgui::code_editor::set_text(const std::string &text)
 	_undo_base_index = 0;
 	_errors.clear();
 
-	for (char c : text)
+	std::string_view::const_iterator it = text.begin();
+	if (utf8::starts_with_bom(it, text.end()))
+		it += std::size(utf8::bom);
+	for (; it < text.end();)
 	{
+		const utf8::utfchar32_t c = utf8::unchecked::next(it);
 		if (c == '\r')
 			continue; // Ignore the carriage return character
 		else if (c == '\n')
@@ -747,25 +773,26 @@ void reshade::imgui::code_editor::set_text(const std::string &text)
 	// Restrict cursor position to new text bounds
 	_select_beg = _select_end = text_pos();
 	_interactive_beg = _interactive_end = text_pos();
-	_cursor_pos = std::min(_cursor_pos, text_pos(_lines.size() - 1, _lines.back().size()));
+	_cursor_pos.line = std::min(_cursor_pos.line, _lines.size() - 1);
+	_cursor_pos.column = std::min(_cursor_pos.column, _lines[_cursor_pos.line].size());
 
 	_colorize_line_beg = 0;
 	_colorize_line_end = _lines.size();
 }
 void reshade::imgui::code_editor::clear_text()
 {
-	set_text(std::string());
+	set_text(std::string_view());
 }
-void reshade::imgui::code_editor::insert_text(const std::string &text)
+void reshade::imgui::code_editor::insert_text(const std::string_view text)
 {
 	// Insert all characters of the text
-	for (const char c : text)
-		insert_character(c, false);
+	for (auto it = text.begin(); it < text.end();)
+		insert_character(utf8::unchecked::next(it), false);
 
 	// Move cursor to end of inserted text
 	select(_cursor_pos, _cursor_pos);
 }
-void reshade::imgui::code_editor::insert_character(char c, bool auto_indent)
+void reshade::imgui::code_editor::insert_character(uint32_t c, bool auto_indent)
 {
 	if (_readonly)
 		return;
@@ -779,7 +806,7 @@ void reshade::imgui::code_editor::insert_character(char c, bool auto_indent)
 			text_pos &beg = _select_beg;
 			text_pos &end = _select_end;
 
-			_colorize_line_beg = std::min(_colorize_line_beg, beg.line - std::min<size_t>(beg.line, 10));
+			_colorize_line_beg = std::min(_colorize_line_beg, beg.line - std::min(beg.line, static_cast<size_t>(10)));
 			_colorize_line_end = std::max(_colorize_line_end, end.line + 10 + 1);
 
 			beg.column = 0;
@@ -850,7 +877,7 @@ void reshade::imgui::code_editor::insert_character(char c, bool auto_indent)
 
 			if (line[0].c == '\t')
 			{
-				u.removed += line[0].c;
+				utf8::unchecked::append(line[0].c, std::back_inserter(u.removed));
 				u.removed_end.column++;
 				line.erase(line.begin());
 				if (_cursor_pos.column > 0)
@@ -858,7 +885,7 @@ void reshade::imgui::code_editor::insert_character(char c, bool auto_indent)
 			}
 			else for (size_t j = 0; j < _tab_size && !line.empty() && line[0].c == ' '; j++) // Do the same for spaces
 			{
-				u.removed += line[0].c;
+				utf8::unchecked::append(line[0].c, std::back_inserter(u.removed));
 				u.removed_end.column++;
 				line.erase(line.begin());
 				if (_cursor_pos.column > 0)
@@ -872,11 +899,12 @@ void reshade::imgui::code_editor::insert_character(char c, bool auto_indent)
 
 	assert(!_lines.empty());
 
-	u.added = c;
+	u.added.clear();
+	utf8::unchecked::append(c, std::back_inserter(u.added));
 	u.added_beg = _cursor_pos;
 
 	// Colorize additional 10 lines above and below to better catch multi-line constructs
-	_colorize_line_beg = std::min(_colorize_line_beg, _cursor_pos.line - std::min<size_t>(_cursor_pos.line, 10));
+	_colorize_line_beg = std::min(_colorize_line_beg, _cursor_pos.line - std::min(_cursor_pos.line, static_cast<size_t>(10)));
 
 	// New line feed requires insertion of a new line
 	if (c == '\n')
@@ -885,7 +913,7 @@ void reshade::imgui::code_editor::insert_character(char c, bool auto_indent)
 		std::unordered_map<size_t, std::pair<std::string, bool>> errors;
 		errors.reserve(_errors.size());
 		for (std::pair<const size_t, std::pair<std::string, bool>> &i : _errors)
-			errors.insert({ i.first >= _cursor_pos.line + 1 ? i.first + 1 : i.first, i.second });
+			errors.insert({ i.first >= _cursor_pos.line + 1 ? i.first + 1 : i.first, std::move(i.second) });
 		_errors = std::move(errors);
 
 		std::vector<glyph> &new_line = *_lines.emplace(_lines.begin() + _cursor_pos.line + 1);
@@ -893,8 +921,13 @@ void reshade::imgui::code_editor::insert_character(char c, bool auto_indent)
 
 		// Auto indentation
 		if (auto_indent && _cursor_pos.column == line.size())
-			for (size_t i = 0; i < line.size() && isblank(line[i].c); ++i)
-				new_line.push_back(line[i]), u.added.push_back(line[i].c);
+		{
+			for (size_t i = 0; i < line.size() && std::isblank(line[i].c); ++i)
+			{
+				new_line.push_back(line[i]);
+				utf8::unchecked::append(line[i].c, std::back_inserter(u.added));
+			}
+		}
 		const size_t indentation = new_line.size();
 
 		new_line.insert(new_line.end(), line.begin() + _cursor_pos.column, line.end());
@@ -946,7 +979,7 @@ std::string reshade::imgui::code_editor::get_text(const text_pos &beg, const tex
 
 		if (it.column < line.size())
 		{
-			result.push_back(line[it.column].c);
+			utf8::unchecked::append(line[it.column].c, std::back_inserter(result));
 
 			it.column++;
 		}
@@ -976,10 +1009,12 @@ void reshade::imgui::code_editor::undo(unsigned int steps)
 		return;
 
 	// Reset selection
-	_select_beg = _select_end = _cursor_pos;
-	_interactive_beg = _interactive_end = _cursor_pos;
+	_select_beg = _cursor_pos;
+	_select_end = _cursor_pos;
+	_interactive_beg = _cursor_pos;
+	_interactive_end = _cursor_pos;
 
-	_in_undo_operation = true;
+	_undo_operation_active = true;
 
 	while (can_undo() && steps-- > 0)
 	{
@@ -995,11 +1030,12 @@ void reshade::imgui::code_editor::undo(unsigned int steps)
 		{
 			_cursor_pos = record.removed_beg;
 			insert_text(record.removed);
+			select(record.removed_beg, record.removed_end);
 		}
 	}
 
 	_scroll_to_cursor = true;
-	_in_undo_operation = false;
+	_undo_operation_active = false;
 }
 void reshade::imgui::code_editor::redo(unsigned int steps)
 {
@@ -1007,10 +1043,12 @@ void reshade::imgui::code_editor::redo(unsigned int steps)
 		return;
 
 	// Reset selection
-	_select_beg = _select_end = _cursor_pos;
-	_interactive_beg = _interactive_end = _cursor_pos;
+	_select_beg = _cursor_pos;
+	_select_end = _cursor_pos;
+	_interactive_beg = _cursor_pos;
+	_interactive_end = _cursor_pos;
 
-	_in_undo_operation = true;
+	_undo_operation_active = true;
 
 	while (can_redo() && steps-- > 0)
 	{
@@ -1026,16 +1064,17 @@ void reshade::imgui::code_editor::redo(unsigned int steps)
 		{
 			_cursor_pos = record.added_beg;
 			insert_text(record.added);
+			select(record.added_beg, record.added_end);
 		}
 	}
 
 	_scroll_to_cursor = true;
-	_in_undo_operation = false;
+	_undo_operation_active = false;
 }
 
 void reshade::imgui::code_editor::record_undo(undo_record &&record)
 {
-	if (_in_undo_operation)
+	if (_undo_operation_active)
 		return;
 
 	_undo.resize(_undo_index); // Remove all undo records after the current one
@@ -1082,7 +1121,8 @@ void reshade::imgui::code_editor::delete_next()
 	}
 	else
 	{
-		u.removed = line[_cursor_pos.column].c;
+		u.removed.clear();
+		utf8::unchecked::append(line[_cursor_pos.column].c, std::back_inserter(u.removed));
 		u.removed_end.column++;
 
 		// Otherwise just remove the character at the cursor position
@@ -1091,7 +1131,7 @@ void reshade::imgui::code_editor::delete_next()
 
 	record_undo(std::move(u));
 
-	_colorize_line_beg = std::min(_colorize_line_beg, _cursor_pos.line - std::min<size_t>(_cursor_pos.line, 10));
+	_colorize_line_beg = std::min(_colorize_line_beg, _cursor_pos.line - std::min(_cursor_pos.line, static_cast<size_t>(10)));
 	_colorize_line_end = std::max(_colorize_line_end, _cursor_pos.line + 10 + 1);
 }
 void reshade::imgui::code_editor::delete_previous()
@@ -1134,7 +1174,8 @@ void reshade::imgui::code_editor::delete_previous()
 	{
 		_cursor_pos.column--;
 
-		u.removed = line[_cursor_pos.column].c;
+		u.removed.clear();
+		utf8::unchecked::append(line[_cursor_pos.column].c, std::back_inserter(u.removed));
 
 		// Otherwise remove the character next to the cursor position
 		line.erase(line.begin() + _cursor_pos.column);
@@ -1145,7 +1186,7 @@ void reshade::imgui::code_editor::delete_previous()
 
 	_scroll_to_cursor = true;
 
-	_colorize_line_beg = std::min(_colorize_line_beg, _cursor_pos.line - std::min<size_t>(_cursor_pos.line, 10));
+	_colorize_line_beg = std::min(_colorize_line_beg, _cursor_pos.line - std::min(_cursor_pos.line, static_cast<size_t>(10)));
 	_colorize_line_end = std::max(_colorize_line_end, _cursor_pos.line + 10 + 1);
 }
 void reshade::imgui::code_editor::delete_selection()
@@ -1191,11 +1232,14 @@ void reshade::imgui::code_editor::delete_selection()
 		assert(!_lines.empty());
 	}
 
-	_colorize_line_beg = std::min(_colorize_line_beg, _select_beg.line - std::min<size_t>(_cursor_pos.line, 10));
+	_colorize_line_beg = std::min(_colorize_line_beg, _select_beg.line - std::min(_cursor_pos.line, static_cast<size_t>(10)));
 	_colorize_line_end = std::max(_colorize_line_end, _select_end.line + 10 + 1);
 
 	// Reset selection
 	_cursor_pos = _select_beg;
+	_interactive_beg = _cursor_pos;
+	_interactive_end = _cursor_pos;
+
 	select(_cursor_pos, _cursor_pos);
 }
 void reshade::imgui::code_editor::delete_lines(size_t first_line, size_t last_line)
@@ -1208,7 +1252,7 @@ void reshade::imgui::code_editor::delete_lines(size_t first_line, size_t last_li
 	errors.reserve(_errors.size());
 	for (std::pair<const size_t, std::pair<std::string, bool>> &i : _errors)
 		if (i.first < first_line && i.first > last_line)
-			errors.insert({ i.first > last_line ? i.first - (last_line - first_line) : i.first, i.second });
+			errors.insert({ i.first > last_line ? i.first - (last_line - first_line) : i.first, std::move(i.second) });
 	_errors = std::move(errors);
 
 	_lines.erase(_lines.begin() + first_line, _lines.begin() + last_line + 1);
@@ -1226,16 +1270,16 @@ void reshade::imgui::code_editor::clipboard_copy()
 	else if (!_lines.empty()) // Copy current line if there is no selection
 	{
 		std::string line_text;
-		line_text.reserve(_lines[_cursor_pos.line].size());
+		line_text.reserve(_lines[_cursor_pos.line].size() + 1);
 		for (const glyph &glyph : _lines[_cursor_pos.line])
-			line_text.push_back(glyph.c);
+			utf8::unchecked::append(glyph.c, std::back_inserter(line_text));
 		// Include new line character
 		line_text += '\n';
 
-		_last_copy_string = line_text;
-		_last_copy_from_empty_selection = true;
-
 		ImGui::SetClipboardText(line_text.c_str());
+
+		_last_copy_string = std::move(line_text);
+		_last_copy_from_empty_selection = true;
 	}
 }
 void reshade::imgui::code_editor::clipboard_cut()
@@ -1258,7 +1302,7 @@ void reshade::imgui::code_editor::clipboard_paste()
 
 	undo_record u;
 
-	_in_undo_operation = true;
+	_undo_operation_active = true;
 
 	bool reset_cursor_pos = false;
 	const size_t cursor_column = _cursor_pos.column;
@@ -1284,7 +1328,7 @@ void reshade::imgui::code_editor::clipboard_paste()
 
 	u.added_end = _cursor_pos;
 
-	_in_undo_operation = false;
+	_undo_operation_active = false;
 
 	record_undo(std::move(u));
 
@@ -1298,10 +1342,10 @@ void reshade::imgui::code_editor::move_up(size_t amount, bool selection)
 	assert(!_lines.empty());
 
 	const text_pos prev_pos = _cursor_pos;
-	_cursor_pos.line = std::max<intptr_t>(0, _cursor_pos.line - amount);
+	_cursor_pos.line = std::max(static_cast<size_t>(0), _cursor_pos.line - amount);
 
 	// The line before could be shorter, so adjust column
-	_cursor_pos.column = std::min<intptr_t>(_cursor_pos.column, _lines[_cursor_pos.line].size());
+	_cursor_pos.column = std::min(_cursor_pos.column, _lines[_cursor_pos.line].size());
 
 	if (prev_pos == _cursor_pos)
 		return;
@@ -1330,10 +1374,10 @@ void reshade::imgui::code_editor::move_down(size_t amount, bool selection)
 	assert(!_lines.empty());
 
 	const text_pos prev_pos = _cursor_pos;
-	_cursor_pos.line = std::min<intptr_t>(_cursor_pos.line + amount, _lines.size() - 1);
+	_cursor_pos.line = std::min(_cursor_pos.line + amount, _lines.size() - 1);
 
 	// The line after could be shorter, so adjust column
-	_cursor_pos.column = std::min<intptr_t>(_cursor_pos.column, _lines[_cursor_pos.line].size());
+	_cursor_pos.column = std::min(_cursor_pos.column, _lines[_cursor_pos.line].size());
 
 	if (prev_pos == _cursor_pos)
 		return;
@@ -1601,17 +1645,20 @@ void reshade::imgui::code_editor::move_lines_down()
 	_cursor_pos.line++;
 }
 
-bool reshade::imgui::code_editor::find_and_scroll_to_text(const std::string &text, bool backwards, bool with_selection)
+bool reshade::imgui::code_editor::find_and_scroll_to_text(const std::string_view text, bool backwards, bool with_selection)
 {
 	if (text.empty())
 		return false; // Cannot search for empty text
 
-	const auto compare_c = [this](char clhs, char crhs) {
-		return _search_case_sensitive ? clhs == crhs : tolower(clhs) == tolower(crhs);
+	const auto compare_c = [this](utf8::utfchar32_t clhs, utf8::utfchar32_t crhs) {
+		return _search_case_sensitive ? clhs == crhs : std::tolower(clhs) == std::tolower(crhs);
 	};
 
 	// Start search at the cursor position
 	text_pos match_pos_beg, search_pos = backwards != with_selection ? _select_beg : _select_end;
+
+	const utf8::unchecked::iterator<std::string_view::iterator> text_begin(text.begin());
+	const utf8::unchecked::iterator<std::string_view::iterator> text_end(text.end());
 
 	if (backwards)
 	{
@@ -1626,8 +1673,8 @@ bool reshade::imgui::code_editor::find_and_scroll_to_text(const std::string &tex
 			search_pos.column = _lines[search_pos.line].size();
 		}
 
-		const size_t match_last = text.size() - 1;
-		size_t match_offset = match_last;
+		const utf8::unchecked::iterator<std::string_view::iterator> match_last = std::prev(text_end);
+		utf8::unchecked::iterator<std::string_view::iterator> match_offset = match_last;
 
 		while (true)
 		{
@@ -1638,13 +1685,13 @@ bool reshade::imgui::code_editor::find_and_scroll_to_text(const std::string &tex
 
 				while (true)
 				{
-					if (compare_c(_lines[search_pos.line][search_pos.column].c, text[match_offset]))
+					if (compare_c(_lines[search_pos.line][search_pos.column].c, *match_offset))
 					{
 						if (match_offset == match_last) // Keep track of end of the match
 							match_pos_beg = search_pos;
 
 						// All characters matching means the text was found, so select it and return
-						if (match_offset == 0)
+						if (match_offset == text_begin)
 						{
 							_select_beg = search_pos;
 							_select_end = text_pos(match_pos_beg.line, match_pos_beg.column + 1);
@@ -1675,7 +1722,7 @@ bool reshade::imgui::code_editor::find_and_scroll_to_text(const std::string &tex
 			else
 				search_pos.line -= 1;
 
-			if (match_offset != match_last && text[match_offset--] != '\n')
+			if (match_offset != match_last && *match_offset-- != '\n')
 				match_offset  = match_last; // Check for line feed in search text between lines
 
 			search_pos.column = _lines[search_pos.line].size(); // Continue at end of previous line
@@ -1683,24 +1730,24 @@ bool reshade::imgui::code_editor::find_and_scroll_to_text(const std::string &tex
 	}
 	else
 	{
-		size_t match_offset = 0;
+		utf8::unchecked::iterator<std::string_view::iterator> match_offset = text_begin;
 
 		while (search_pos.line < _lines.size())
 		{
-			if (match_offset != 0 && text[match_offset++] != '\n')
-				match_offset  = 0; // Check for line feed in search text between lines
+			if (match_offset != text_begin && *match_offset++ != '\n')
+				match_offset  = text_begin; // Check for line feed in search text between lines
 
 			while (search_pos.column < _lines[search_pos.line].size())
 			{
-				if (compare_c(_lines[search_pos.line][search_pos.column].c, text[match_offset]))
+				if (compare_c(_lines[search_pos.line][search_pos.column].c, *match_offset))
 				{
-					if (match_offset == 0) // Keep track of beginning of the match
+					if (match_offset == text_begin) // Keep track of beginning of the match
 						match_pos_beg = search_pos;
 
 					match_offset++;
 
 					// All characters matching means the text was found, so select it and return
-					if (match_offset == text.size())
+					if (match_offset == text_end)
 					{
 						_select_beg = match_pos_beg;
 						_select_end = text_pos(search_pos.line, search_pos.column + 1);
@@ -1712,7 +1759,7 @@ bool reshade::imgui::code_editor::find_and_scroll_to_text(const std::string &tex
 				else
 				{
 					// A character mismatched, so start from the beginning again
-					match_offset = 0;
+					match_offset = text_begin;
 				}
 
 				search_pos.column += 1;
@@ -1725,6 +1772,8 @@ bool reshade::imgui::code_editor::find_and_scroll_to_text(const std::string &tex
 
 	return false; // No match found
 }
+
+#include "effect_lexer.hpp"
 
 void reshade::imgui::code_editor::colorize()
 {
@@ -1744,11 +1793,11 @@ void reshade::imgui::code_editor::colorize()
 		_colorize_line_end = 0;
 	}
 
-	// Copy lines into string for consumption by the lexer
+	// Copy lines into string for consumption by the lexer (needs to use the same offsets as the indices in '_lines', so strip any unicode characters which are multi-byte)
 	std::string input_string;
 	for (size_t l = from; l < to && l < _lines.size(); ++l, input_string.push_back('\n'))
 		for (size_t k = 0; k < _lines[l].size(); ++k)
-			input_string.push_back(_lines[l][k].c);
+			input_string += _lines[l][k].c < 0x80 ? static_cast<char>(_lines[l][k].c) : '?';
 
 	reshadefx::lexer lexer(
 		std::move(input_string),
@@ -1927,9 +1976,15 @@ void reshade::imgui::code_editor::colorize()
 		case reshadefx::tokenid::vector:
 		case reshadefx::tokenid::matrix:
 		case reshadefx::tokenid::string_:
-		case reshadefx::tokenid::texture:
-		case reshadefx::tokenid::sampler:
-		case reshadefx::tokenid::storage:
+		case reshadefx::tokenid::texture1d:
+		case reshadefx::tokenid::texture2d:
+		case reshadefx::tokenid::texture3d:
+		case reshadefx::tokenid::sampler1d:
+		case reshadefx::tokenid::sampler2d:
+		case reshadefx::tokenid::sampler3d:
+		case reshadefx::tokenid::storage1d:
+		case reshadefx::tokenid::storage2d:
+		case reshadefx::tokenid::storage3d:
 			col = color_keyword;
 			break;
 		case reshadefx::tokenid::hash_def:

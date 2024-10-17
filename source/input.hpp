@@ -5,9 +5,9 @@
 
 #pragma once
 
+#include <mutex>
 #include <memory>
 #include <string>
-#include <shared_mutex>
 
 namespace reshade
 {
@@ -44,8 +44,6 @@ namespace reshade
 		/// <returns>Pointer to the input manager registered for this <paramref name="window"/>.</returns>
 		static std::shared_ptr<input> register_window(window_handle window);
 
-		window_handle get_window_handle() const { return _window; }
-
 		// Before accessing input data with any of the member functions below, first call "lock()" and keep the returned object alive while accessing it.
 
 		bool is_key_down(unsigned int keycode) const;
@@ -53,6 +51,7 @@ namespace reshade
 		bool is_key_pressed(unsigned int keycode, bool ctrl, bool shift, bool alt, bool force_modifiers = false) const;
 		bool is_key_pressed(const unsigned int key[4], bool force_modifiers = false) const { return is_key_pressed(key[0], key[1] != 0, key[2] != 0, key[3] != 0, force_modifiers); }
 		bool is_key_released(unsigned int keycode) const;
+		bool is_key_repeated(unsigned int keycode) const;
 		bool is_any_key_down() const;
 		bool is_any_key_pressed() const;
 		bool is_any_key_released() const;
@@ -91,7 +90,7 @@ namespace reshade
 		/// Locks access to the input data so it cannot be modified in another thread.
 		/// </summary>
 		/// <returns>RAII object holding the lock, which releases it after going out of scope.</returns>
-		auto lock() { return std::shared_lock<std::shared_mutex>(_mutex); }
+		auto lock() { return std::unique_lock<std::recursive_mutex>(_mutex); }
 
 		/// <summary>
 		/// Notifies the input manager to advance a frame.
@@ -118,11 +117,12 @@ namespace reshade
 		static bool handle_window_message(const void *message_data);
 
 	private:
-		std::shared_mutex _mutex;
+		std::recursive_mutex _mutex;
 		window_handle _window;
 		bool _block_mouse = false;
 		bool _block_keyboard = false;
 		uint8_t _keys[256] = {};
+		uint8_t _last_keys[256] = {};
 		unsigned int _keys_time[256] = {};
 		short _mouse_wheel_delta = 0;
 		unsigned int _mouse_position[2] = {};

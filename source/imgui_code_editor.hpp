@@ -7,6 +7,7 @@
 #pragma once
 
 #include <string>
+#include <string_view>
 #include <vector>
 #include <unordered_map>
 
@@ -109,12 +110,12 @@ namespace reshade::imgui
 		/// <param name="backwards">Set to <see langword="true"/> to search in reverse direction, otherwise searches forwards.</param>
 		/// <param name="with_selection">Set to <see langword="true"/> to start search at selection boundaries, rather than the cursor position.</param>
 		/// <returns><see langword="true"/> when the search <paramref name="text"/> was found, <see langword="false"/> otherwise.</returns>
-		bool find_and_scroll_to_text(const std::string &text, bool backwards = false, bool with_selection = false);
+		bool find_and_scroll_to_text(const std::string_view text, bool backwards = false, bool with_selection = false);
 
 		/// <summary>
 		/// Replaces the text of this text editor with the specified string.
 		/// </summary>
-		void set_text(const std::string &text);
+		void set_text(const std::string_view text);
 		/// <summary>
 		/// Clears the text of this text editor to an empty string.
 		/// </summary>
@@ -122,7 +123,7 @@ namespace reshade::imgui
 		/// <summary>
 		/// Inserts the specified <paramref name="text"/> at the cursor position.
 		/// </summary>
-		void insert_text(const std::string &text);
+		void insert_text(const std::string_view text);
 		/// <summary>
 		/// Returns the entire text of this text editor as a string.
 		/// </summary>
@@ -168,7 +169,7 @@ namespace reshade::imgui
 		/// <param name="line">Line that should be highlighted and show an error message when hovered with the mouse.</param>
 		/// <param name="message">Error message that should be displayed.</param>
 		/// <param name="warning">Set to <see langword="true"/> to indicate that this is a warning instead of an error, which uses different color coding.</param>
-		void add_error(size_t line, const std::string &message, bool warning = false) { _errors.emplace(line, std::make_pair(message, warning)); }
+		void add_error(size_t line, const std::string_view message, bool warning = false) { _errors.emplace(line, std::make_pair(message, warning)); }
 		/// <summary>
 		/// Removes all displayed errors that were previously added via <see cref="add_error"/>.
 		/// </summary>
@@ -199,7 +200,7 @@ namespace reshade::imgui
 	private:
 		struct glyph
 		{
-			char c = '\0';
+			uint32_t c = '\0';
 			color col = color_default;
 		};
 
@@ -215,7 +216,7 @@ namespace reshade::imgui
 
 		void record_undo(undo_record &&record);
 
-		void insert_character(char c, bool auto_indent);
+		void insert_character(uint32_t c, bool auto_indent);
 
 		void delete_next();
 		void delete_previous();
@@ -256,23 +257,21 @@ namespace reshade::imgui
 		text_pos _select_end;
 		text_pos _interactive_beg;
 		text_pos _interactive_end;
-		std::string _highlighted;
+		std::vector<uint32_t> _highlighted;
 		std::string _last_copy_string;
 		bool _last_copy_from_empty_selection = false;
 
-		bool _in_undo_operation = false;
+		bool _undo_operation_active = false;
 		size_t _undo_index = 0;
 		size_t _undo_base_index = 0;
 		std::vector<undo_record> _undo;
 
 		std::unordered_map<size_t, std::pair<std::string, bool>> _errors;
 
+		signed int _search_window_open = 0;
 		char _search_text[256] = "";
 		char _replace_text[256] = "";
-		bool _show_search_popup = false;
 		bool _search_case_sensitive = false;
-		unsigned int _search_window_open = 0;
-		unsigned int _search_window_focus = 0;
 
 		size_t _colorize_line_beg = 0;
 		size_t _colorize_line_end = 0;

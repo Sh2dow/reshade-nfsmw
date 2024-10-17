@@ -14,8 +14,12 @@ namespace reshade::d3d12
 		static constexpr uint32_t NUM_COMMAND_FRAMES = 4; // Use power of two so that modulo can be replaced with bitwise operation
 
 	public:
+		static thread_local command_list_immediate_impl *s_last_immediate_command_list;
+
 		command_list_immediate_impl(device_impl *device, ID3D12CommandQueue *queue);
 		~command_list_immediate_impl();
+
+		void end_query(api::query_heap heap, api::query_type type, uint32_t index) final;
 
 		bool flush();
 		bool flush_and_wait();
@@ -27,5 +31,8 @@ namespace reshade::d3d12
 		UINT64 _fence_value[NUM_COMMAND_FRAMES] = {};
 		com_ptr<ID3D12Fence> _fence[NUM_COMMAND_FRAMES];
 		com_ptr<ID3D12CommandAllocator> _cmd_alloc[NUM_COMMAND_FRAMES];
+
+		// List of query fences scheduled for signaling during next flush
+		std::vector<std::pair<ID3D12Fence *, UINT64>> _current_query_fences;
 	};
 }

@@ -23,6 +23,7 @@ extern std::filesystem::path g_reshade_dll_path;
 extern std::filesystem::path g_reshade_base_path;
 extern std::filesystem::path g_target_executable_path;
 
+extern std::filesystem::path get_base_path(bool default_to_target_executable_path = false);
 extern std::filesystem::path get_module_path(HMODULE module);
 
 #define HR_CHECK(exp) { const HRESULT res = (exp); assert(SUCCEEDED(res)); }
@@ -31,6 +32,21 @@ extern std::filesystem::path get_module_path(HMODULE module);
 #define VK_CALL_CMD(name, device, ...) reinterpret_cast<PFN_##name>(vkGetDeviceProcAddr(device, #name))(__VA_ARGS__)
 #define VK_CALL_DEVICE(name, device, ...) reinterpret_cast<PFN_##name>(vkGetDeviceProcAddr(device, #name))(device, __VA_ARGS__)
 #define VK_CALL_INSTANCE(name, instance, ...) reinterpret_cast<PFN_##name>(vkGetInstanceProcAddr(instance, #name))(__VA_ARGS__)
+
+struct scoped_module_handle
+{
+	scoped_module_handle(LPCWSTR name) : module(LoadLibraryW(name))
+	{
+		assert(module != nullptr);
+		reshade::hooks::register_module(name);
+	}
+	~scoped_module_handle()
+	{
+		FreeLibrary(module);
+	}
+
+	const HMODULE module;
+};
 
 static LONG APIENTRY HookD3DKMTQueryAdapterInfo(const void *pData)
 {
@@ -52,7 +68,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int nCmdShow
 	g_module_handle = hInstance;
 	g_reshade_dll_path = get_module_path(hInstance);
 	g_target_executable_path = g_reshade_dll_path;
-	g_reshade_base_path = g_reshade_dll_path.parent_path();
+	g_reshade_base_path = get_base_path();
 
 	std::error_code ec;
 	reshade::log::open_log_file(g_reshade_base_path / L"ReShade.log", ec);
@@ -88,11 +104,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int nCmdShow
 	RegisterClass(&wc);
 
 	LONG window_w = 1024;
-	if (LPSTR width_arg = strstr(lpCmdLine, "-width "))
-		window_w = strtol(width_arg + 7, nullptr, 10);
+	if (LPSTR width_arg = std::strstr(lpCmdLine, "-width "))
+		window_w = std::strtol(width_arg + 7, nullptr, 10);
 	LONG window_h =  800;
-	if (LPSTR height_arg = strstr(lpCmdLine, "-height "))
-		window_h = strtol(height_arg + 8, nullptr, 10);
+	if (LPSTR height_arg = std::strstr(lpCmdLine, "-height "))
+		window_h = std::strtol(height_arg + 8, nullptr, 10);
 
 	const LONG window_x = (GetSystemMetrics(SM_CXSCREEN) - window_w) / 2;
 	const LONG window_y = (GetSystemMetrics(SM_CYSCREEN) - window_h) / 2;
@@ -119,6 +135,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int nCmdShow
 	reshade::api::device_api api = reshade::api::device_api::d3d11;
 	if (strstr(lpCmdLine, "-d3d9"))
 		api = reshade::api::device_api::d3d9;
+	if (strstr(lpCmdLine, "-d3d10"))
+		api = reshade::api::device_api::d3d10;
 	if (strstr(lpCmdLine, "-d3d11"))
 		api = reshade::api::device_api::d3d11;
 	if (strstr(lpCmdLine, "-d3d12"))
@@ -128,19 +146,20 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int nCmdShow
 	if (strstr(lpCmdLine, "-vulkan"))
 		api = reshade::api::device_api::vulkan;
 
+	const bool multisample = strstr(lpCmdLine, "-multisample") != nullptr;
+
 	switch (api)
 	{
 	#pragma region D3D9 Implementation
 	case reshade::api::device_api::d3d9:
 	{
-		const auto d3d9_module = LoadLibraryW(L"d3d9.dll");
-		assert(d3d9_module != nullptr);
-		reshade::hooks::register_module(L"d3d9.dll");
+		const scoped_module_handle d3d9_module(L"d3d9.dll");
 
 		D3DPRESENT_PARAMETERS pp = {};
 		pp.SwapEffect = D3DSWAPEFFECT_DISCARD;
 		pp.hDeviceWindow = window_handle;
 		pp.Windowed = true;
+		pp.MultiSampleType = multisample ? D3DMULTISAMPLE_4_SAMPLES : D3DMULTISAMPLE_NONE;
 		pp.PresentationInterval = D3DPRESENT_INTERVAL_ONE;
 
 		// Initialize Direct3D 9
@@ -168,20 +187,74 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int nCmdShow
 			HR_CHECK(device->Clear(0, nullptr, D3DCLEAR_TARGET, 0xFF7F7F7F, 0, 0));
 			HR_CHECK(device->Present(nullptr, nullptr, nullptr, nullptr));
 		}
+	}
+	#pragma endregion
+		break;
+	#pragma region D3D10 Implementation
+	case reshade::api::device_api::d3d10:
+	{
+		const scoped_module_handle dxgi_module(L"dxgi.dll");
+		const scoped_module_handle d3d11_module(L"d3d10_1.dll");
 
-		FreeLibrary(d3d9_module);
+		// Initialize Direct3D 10
+		com_ptr<ID3D10Device> device;
+		com_ptr<IDXGISwapChain> swapchain;
+
+		{   DXGI_SWAP_CHAIN_DESC desc = {};
+			desc.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+			desc.SampleDesc = { multisample ? 4u : 1u, 0u };
+			desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+			desc.BufferCount = 1;
+			desc.OutputWindow = window_handle;
+			desc.Windowed = true;
+			desc.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+
+#ifndef NDEBUG
+			const UINT flags = D3D11_CREATE_DEVICE_DEBUG;
+#else
+			const UINT flags = 0;
+#endif
+			HR_CHECK(D3D10CreateDeviceAndSwapChain(nullptr, D3D10_DRIVER_TYPE_HARDWARE, nullptr, flags, D3D10_SDK_VERSION, &desc, &swapchain, &device));
+		}
+
+		com_ptr<ID3D10Texture2D> backbuffer;
+		HR_CHECK(swapchain->GetBuffer(0, IID_PPV_ARGS(&backbuffer)));
+		com_ptr<ID3D10RenderTargetView> target;
+		HR_CHECK(device->CreateRenderTargetView(backbuffer.get(), nullptr, &target));
+
+		while (true)
+		{
+			while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE) && msg.message != WM_QUIT)
+				DispatchMessage(&msg);
+			if (msg.message == WM_QUIT)
+				break;
+
+			if (s_resize_w != 0)
+			{
+				target.reset();
+				backbuffer.reset();
+
+				HR_CHECK(swapchain->ResizeBuffers(1, s_resize_w, s_resize_h, DXGI_FORMAT_UNKNOWN, 0));
+
+				HR_CHECK(swapchain->GetBuffer(0, IID_PPV_ARGS(&backbuffer)));
+				HR_CHECK(device->CreateRenderTargetView(backbuffer.get(), nullptr, &target));
+
+				s_resize_w = s_resize_h = 0;
+			}
+
+			const float color[4] = { 0.5f, 0.5f, 0.5f, 1.0f };
+			device->ClearRenderTargetView(target.get(), color);
+
+			HR_CHECK(swapchain->Present(1, 0));
+		}
 	}
 	#pragma endregion
 		break;
 	#pragma region D3D11 Implementation
 	case reshade::api::device_api::d3d11:
 	{
-		const auto dxgi_module = LoadLibraryW(L"dxgi.dll");
-		const auto d3d11_module = LoadLibraryW(L"d3d11.dll");
-		assert(dxgi_module != nullptr);
-		assert(d3d11_module != nullptr);
-		reshade::hooks::register_module(L"dxgi.dll");
-		reshade::hooks::register_module(L"d3d11.dll");
+		const scoped_module_handle dxgi_module(L"dxgi.dll");
+		const scoped_module_handle d3d11_module(L"d3d11.dll");
 
 		// Initialize Direct3D 11
 		com_ptr<ID3D11Device> device;
@@ -190,7 +263,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int nCmdShow
 
 		{   DXGI_SWAP_CHAIN_DESC desc = {};
 			desc.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-			desc.SampleDesc = { 1, 0 };
+			desc.SampleDesc = { multisample ? 4u : 1u, 0u };
 			desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
 			desc.BufferCount = 1;
 			desc.OutputWindow = window_handle;
@@ -235,21 +308,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int nCmdShow
 
 			HR_CHECK(swapchain->Present(1, 0));
 		}
-
-		FreeLibrary(dxgi_module);
-		FreeLibrary(d3d11_module);
 	}
 	#pragma endregion
 		break;
 	#pragma region D3D12 Implementation
 	case reshade::api::device_api::d3d12:
 	{
-		const auto dxgi_module = LoadLibraryW(L"dxgi.dll");
-		const auto d3d12_module = LoadLibraryW(L"d3d12.dll");
-		assert(dxgi_module != nullptr);
-		assert(d3d12_module != nullptr);
-		reshade::hooks::register_module(L"dxgi.dll");
-		reshade::hooks::register_module(L"d3d12.dll");
+		const scoped_module_handle dxgi_module(L"dxgi.dll");
+		const scoped_module_handle d3d12_module(L"d3d12.dll");
 
 #ifndef NDEBUG
 		// Enable D3D debug layer if it is available
@@ -271,9 +337,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int nCmdShow
 
 		HR_CHECK(CreateDXGIFactory2(DXGI_CREATE_FACTORY_DEBUG, IID_PPV_ARGS(&dxgi_factory)));
 
-		{	HRESULT hr = E_FAIL; IDXGIAdapter *adapter = nullptr;
-			for (UINT i = 0; dxgi_factory->EnumAdapters(i, &adapter) != DXGI_ERROR_NOT_FOUND; i++)
-				if (SUCCEEDED(hr = D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device))))
+		{	HRESULT hr = E_FAIL; com_ptr<IDXGIAdapter> adapter;
+			for (UINT i = 0; dxgi_factory->EnumAdapters(i, &adapter) != DXGI_ERROR_NOT_FOUND; i++, adapter.reset())
+				if (SUCCEEDED(hr = D3D12CreateDevice(adapter.get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device))))
 					break;
 			HR_CHECK(hr);
 		}
@@ -412,21 +478,21 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int nCmdShow
 				HR_CHECK(swapchain->Present(1, 0));
 			}
 		}
-
-		FreeLibrary(dxgi_module);
-		FreeLibrary(d3d12_module);
 	}
 	#pragma endregion
 		break;
 	#pragma region OpenGL Implementation
 	case reshade::api::device_api::opengl:
 	{
-		const auto opengl_module = LoadLibraryW(L"opengl32.dll");
-		assert(opengl_module != nullptr);
-		reshade::hooks::register_module(L"opengl32.dll");
+		const scoped_module_handle opengl_module(L"opengl32.dll");
 
 		// Initialize OpenGL
-		const HDC hdc = GetDC(window_handle);
+		const HWND temp_window_handle = CreateWindow(TEXT("STATIC"), nullptr, WS_POPUP, 0, 0, 0, 0, window_handle, nullptr, hInstance, nullptr);
+		if (temp_window_handle == nullptr)
+			return 0;
+
+		const HDC hdc1 = GetDC(temp_window_handle);
+		const HDC hdc2 = GetDC(window_handle);
 
 		PIXELFORMATDESCRIPTOR pfd = { sizeof(pfd), 1 };
 		pfd.dwFlags = PFD_DOUBLEBUFFER | PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL;
@@ -434,13 +500,35 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int nCmdShow
 		pfd.cColorBits = 24;
 		pfd.cAlphaBits = 8;
 
-		SetPixelFormat(hdc, ChoosePixelFormat(hdc, &pfd), &pfd);
+		int pix_format = ChoosePixelFormat(hdc1, &pfd);
+		SetPixelFormat(hdc1, pix_format, &pfd);
 
-		const HGLRC hglrc1 = wglCreateContext(hdc);
+		const HGLRC hglrc1 = wglCreateContext(hdc1);
 		if (hglrc1 == nullptr)
 			return 0;
 
-		wglMakeCurrent(hdc, hglrc1);
+		wglMakeCurrent(hdc1, hglrc1);
+
+		const auto wglChoosePixelFormatARB = reinterpret_cast<BOOL(WINAPI *)(HDC, const int *, const FLOAT *, UINT, int *, UINT *)>(wglGetProcAddress("wglChoosePixelFormatARB"));
+		const auto wglCreateContextAttribsARB = reinterpret_cast<HGLRC(WINAPI *)(HDC, HGLRC, const int *)>(wglGetProcAddress("wglCreateContextAttribsARB"));
+
+		const int pix_attribs[] = {
+			0x2011 /* WGL_DOUBLE_BUFFER_ARB */, 1,
+			0x2001 /* WGL_DRAW_TO_WINDOW_ARB */, 1,
+			0x2010 /* WGL_SUPPORT_OPENGL_ARB */, 1,
+			0x2013 /* WGL_PIXEL_TYPE_ARB */, 0x202B /* WGL_TYPE_RGBA_ARB */,
+			0x2014 /* WGL_COLOR_BITS_ARB */, pfd.cColorBits,
+			0x201B /* WGL_ALPHA_BITS_ARB */, pfd.cAlphaBits,
+			0x2041 /* WGL_SAMPLE_BUFFERS_ARB */, multisample ? GL_TRUE : GL_FALSE,
+			0x2042 /* WGL_SAMPLES_ARB */, multisample ? 4 : 1,
+			0 // Terminate list
+		};
+
+		UINT num_formats = 0;
+		if (!wglChoosePixelFormatARB(hdc2, pix_attribs, nullptr, 1, &pix_format, &num_formats))
+			return 0;
+
+		SetPixelFormat(hdc2, pix_format, &pfd);
 
 		// Create an OpenGL 4.3 context
 		const int attribs[] = {
@@ -449,14 +537,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int nCmdShow
 			0 // Terminate list
 		};
 
-		const HGLRC hglrc2 = reinterpret_cast<HGLRC(WINAPI*)(HDC, HGLRC, const int *)>(
-			wglGetProcAddress("wglCreateContextAttribsARB"))(hdc, nullptr, attribs);
+		const HGLRC hglrc2 = wglCreateContextAttribsARB(hdc2, nullptr, attribs);
 		if (hglrc2 == nullptr)
 			return 0;
 
 		wglMakeCurrent(nullptr, nullptr);
 		wglDeleteContext(hglrc1);
-		wglMakeCurrent(hdc, hglrc2);
+		DestroyWindow(temp_window_handle);
+
+		wglMakeCurrent(hdc2, hglrc2);
 
 		while (true)
 		{
@@ -476,25 +565,21 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int nCmdShow
 			glClear(GL_COLOR_BUFFER_BIT);
 
 #if 1
-			wglSwapLayerBuffers(hdc, WGL_SWAP_MAIN_PLANE); // Call directly for RenderDoc compatibility
+			wglSwapLayerBuffers(hdc2, WGL_SWAP_MAIN_PLANE); // Call directly for RenderDoc compatibility
 #else
-			SwapBuffers(hdc);
+			SwapBuffers(hdc2);
 #endif
 		}
 
 		wglMakeCurrent(nullptr, nullptr);
 		wglDeleteContext(hglrc2);
-
-		FreeLibrary(opengl_module);
 	}
 	#pragma endregion
 		break;
 	#pragma region Vulkan Implementation
 	case reshade::api::device_api::vulkan:
 	{
-		const auto vulkan_module = LoadLibraryW(L"vulkan-1.dll");
-		assert(vulkan_module != nullptr);
-		reshade::hooks::register_module(L"vulkan-1.dll");
+		const scoped_module_handle vulkan_module(L"vulkan-1.dll");
 
 		VkDevice device = VK_NULL_HANDLE;
 		VkInstance instance = VK_NULL_HANDLE;
@@ -742,8 +827,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int nCmdShow
 		VK_CALL_INSTANCE(vkDestroySurfaceKHR, instance, instance, surface, nullptr);
 		VK_CALL_DEVICE(vkDestroyDevice, device, nullptr);
 		VK_CALL_INSTANCE(vkDestroyInstance, instance, instance, nullptr);
-
-		FreeLibrary(vulkan_module);
 	}
 	#pragma endregion
 		break;

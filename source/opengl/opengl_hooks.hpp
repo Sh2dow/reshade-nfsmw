@@ -25,6 +25,8 @@ extern "C" void APIENTRY glBindImageTexture(GLuint unit, GLuint texture, GLint l
 extern "C" void APIENTRY glBindImageTextures(GLuint first, GLsizei count, const GLuint *textures);
 #undef glBindMultiTextureEXT
 extern "C" void APIENTRY glBindMultiTextureEXT(GLenum texunit, GLenum target, GLuint texture);
+#undef glBindProgramARB
+extern "C" void APIENTRY glBindProgramARB(GLenum target, GLuint program);
 #undef glBindTexture
 extern "C" void APIENTRY glBindTexture(GLenum target, GLuint texture);
 #undef glBindTextureUnit
@@ -37,8 +39,16 @@ extern "C" void APIENTRY glBindVertexArray(GLuint array);
 extern "C" void APIENTRY glBindVertexBuffer(GLuint bindingindex, GLuint buffer, GLintptr offset, GLsizei stride);
 #undef glBindVertexBuffers
 extern "C" void APIENTRY glBindVertexBuffers(GLuint first, GLsizei count, const GLuint *buffers, const GLintptr *offsets, const GLsizei *strides);
+#undef glBlendColor
+extern "C" void APIENTRY glBlendColor(GLfloat red, GLfloat green, GLfloat blue, GLfloat alpha);
+#undef glBlendEquation
+extern "C" void APIENTRY glBlendEquation(GLenum mode);
+#undef glBlendEquationSeparate
+extern "C" void APIENTRY glBlendEquationSeparate(GLenum modeRGB, GLenum modeAlpha);
 #undef glBlendFunc
 extern "C" void APIENTRY glBlendFunc(GLenum sfactor, GLenum dfactor);
+#undef glBlendFuncSeparate
+extern "C" void APIENTRY glBlendFuncSeparate(GLenum sfactorRGB, GLenum dfactorRGB, GLenum sfactorAlpha, GLenum dfactorAlpha);
 #undef glBlitFramebuffer
 extern "C" void APIENTRY glBlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1, GLint dstX0, GLint dstY0, GLint dstX1, GLint dstY1, GLbitfield mask, GLenum filter);
 #undef glBlitNamedFramebuffer
@@ -51,10 +61,18 @@ extern "C" void APIENTRY glBufferStorage(GLenum target, GLsizeiptr size, const v
 extern "C" void APIENTRY glBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, const void* data);
 #undef glClear
 extern "C" void APIENTRY glClear(GLbitfield mask);
+#undef glClearBufferiv
+extern "C" void APIENTRY glClearBufferiv(GLenum buffer, GLint drawbuffer, const GLint *value);
+#undef glClearBufferuiv
+extern "C" void APIENTRY glClearBufferuiv(GLenum buffer, GLint drawbuffer, const GLuint *value);
 #undef glClearBufferfv
 extern "C" void APIENTRY glClearBufferfv(GLenum buffer, GLint drawbuffer, const GLfloat *value);
 #undef glClearBufferfi
 extern "C" void APIENTRY glClearBufferfi(GLenum buffer, GLint drawbuffer, GLfloat depth, GLint stencil);
+#undef glClearNamedFramebufferiv
+extern "C" void APIENTRY glClearNamedFramebufferiv(GLuint framebuffer, GLenum buffer, GLint drawbuffer, const GLint *value);
+#undef glClearNamedFramebufferuiv
+extern "C" void APIENTRY glClearNamedFramebufferuiv(GLuint framebuffer, GLenum buffer, GLint drawbuffer, const GLuint *value);
 #undef glClearNamedFramebufferfv
 extern "C" void APIENTRY glClearNamedFramebufferfv(GLuint framebuffer, GLenum buffer, GLint drawbuffer, const GLfloat *value);
 #undef glClearNamedFramebufferfi
@@ -119,6 +137,8 @@ extern "C" void APIENTRY glDeleteProgramsARB(GLsizei n, const GLuint *programs);
 extern "C" void APIENTRY glDeleteRenderbuffers(GLsizei n, const GLuint *renderbuffers);
 #undef glDeleteTextures
 extern "C" void APIENTRY glDeleteTextures(GLsizei n, const GLuint *textures);
+#undef glDeleteVertexArrays
+extern "C" void APIENTRY glDeleteVertexArrays(GLsizei n, const GLuint *arrays);
 #undef glDepthFunc
 extern "C" void APIENTRY glDepthFunc(GLenum func);
 #undef glDepthMask
@@ -281,10 +301,16 @@ extern "C" void APIENTRY glScissorIndexedv(GLuint index, const GLint *v);
 extern "C" void APIENTRY glShaderSource(GLuint shader, GLsizei count, const GLchar *const *string, const GLint *length);
 #undef glStencilFunc
 extern "C" void APIENTRY glStencilFunc(GLenum func, GLint ref, GLuint mask);
-#undef glStencilMask
-extern "C" void APIENTRY glStencilMask(GLuint mask);
+#undef glStencilFuncSeparate
+extern "C" void APIENTRY glStencilFuncSeparate(GLenum face, GLenum func, GLint ref, GLuint mask);
 #undef glStencilOp
 extern "C" void APIENTRY glStencilOp(GLenum fail, GLenum zfail, GLenum zpass);
+#undef glStencilOpSeparate
+extern "C" void APIENTRY glStencilOpSeparate(GLenum face, GLenum fail, GLenum zfail, GLenum zpass);
+#undef glStencilMask
+extern "C" void APIENTRY glStencilMask(GLuint mask);
+#undef glStencilMaskSeparate
+extern "C" void APIENTRY glStencilMaskSeparate(GLenum face, GLuint mask);
 #undef glTexBuffer
 extern "C" void APIENTRY glTexBuffer(GLenum target, GLenum internalformat, GLuint buffer);
 #undef glTextureBuffer
@@ -370,35 +396,59 @@ extern "C" void APIENTRY glUniform3ui(GLint location, GLuint v0, GLuint v1, GLui
 #undef glUniform4ui
 extern "C" void APIENTRY glUniform4ui(GLint location, GLuint v0, GLuint v1, GLuint v2, GLuint v3);
 #undef glUniform1fv
-extern "C" void APIENTRY glUniform1fv(GLint location, GLsizei count, const GLfloat *v);
+extern "C" void APIENTRY glUniform1fv(GLint location, GLsizei count, const GLfloat *value);
 #undef glUniform2fv
-extern "C" void APIENTRY glUniform2fv(GLint location, GLsizei count, const GLfloat *v);
+extern "C" void APIENTRY glUniform2fv(GLint location, GLsizei count, const GLfloat *value);
 #undef glUniform3fv
-extern "C" void APIENTRY glUniform3fv(GLint location, GLsizei count, const GLfloat *v);
+extern "C" void APIENTRY glUniform3fv(GLint location, GLsizei count, const GLfloat *value);
 #undef glUniform4fv
-extern "C" void APIENTRY glUniform4fv(GLint location, GLsizei count, const GLfloat *v);
+extern "C" void APIENTRY glUniform4fv(GLint location, GLsizei count, const GLfloat *value);
 #undef glUniform1iv
-extern "C" void APIENTRY glUniform1iv(GLint location, GLsizei count, const GLint *v);
+extern "C" void APIENTRY glUniform1iv(GLint location, GLsizei count, const GLint *value);
 #undef glUniform2iv
-extern "C" void APIENTRY glUniform2iv(GLint location, GLsizei count, const GLint *v);
+extern "C" void APIENTRY glUniform2iv(GLint location, GLsizei count, const GLint *value);
 #undef glUniform3iv
-extern "C" void APIENTRY glUniform3iv(GLint location, GLsizei count, const GLint *v);
+extern "C" void APIENTRY glUniform3iv(GLint location, GLsizei count, const GLint *value);
 #undef glUniform4iv
-extern "C" void APIENTRY glUniform4iv(GLint location, GLsizei count, const GLint *v);
+extern "C" void APIENTRY glUniform4iv(GLint location, GLsizei count, const GLint *value);
 #undef glUniform1uiv
-extern "C" void APIENTRY glUniform1uiv(GLint location, GLsizei count, const GLuint *v);
+extern "C" void APIENTRY glUniform1uiv(GLint location, GLsizei count, const GLuint *value);
 #undef glUniform2uiv
-extern "C" void APIENTRY glUniform2uiv(GLint location, GLsizei count, const GLuint *v);
+extern "C" void APIENTRY glUniform2uiv(GLint location, GLsizei count, const GLuint *value);
 #undef glUniform3uiv
-extern "C" void APIENTRY glUniform3uiv(GLint location, GLsizei count, const GLuint *v);
+extern "C" void APIENTRY glUniform3uiv(GLint location, GLsizei count, const GLuint *value);
 #undef glUniform4uiv
-extern "C" void APIENTRY glUniform4uiv(GLint location, GLsizei count, const GLuint *v);
+extern "C" void APIENTRY glUniform4uiv(GLint location, GLsizei count, const GLuint *value);
+#undef glUniformMatrix2fv
+extern "C" void APIENTRY glUniformMatrix2fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat *value);
+#undef glUniformMatrix3fv
+extern "C" void APIENTRY glUniformMatrix3fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat *value);
+#undef glUniformMatrix4fv
+extern "C" void APIENTRY glUniformMatrix4fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat *value);
+#undef glUniformMatrix2x3fv
+extern "C" void APIENTRY glUniformMatrix2x3fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat *value);
+#undef glUniformMatrix3x2fv
+extern "C" void APIENTRY glUniformMatrix3x2fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat *value);
+#undef glUniformMatrix2x4fv
+extern "C" void APIENTRY glUniformMatrix2x4fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat *value);
+#undef glUniformMatrix4x2fv
+extern "C" void APIENTRY glUniformMatrix4x2fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat *value);
+#undef glUniformMatrix3x4fv
+extern "C" void APIENTRY glUniformMatrix3x4fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat *value);
+#undef glUniformMatrix4x3fv
+extern "C" void APIENTRY glUniformMatrix4x3fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat *value);
 #undef glUnmapBuffer
 extern "C" void APIENTRY glUnmapBuffer(GLenum target);
 #undef glUnmapNamedBuffer
 extern "C" void APIENTRY glUnmapNamedBuffer(GLuint buffer);
 #undef glUseProgram
 extern "C" void APIENTRY glUseProgram(GLuint program);
+#undef glVertexAttribPointer
+extern "C" void APIENTRY glVertexAttribPointer(GLuint index, GLint size, GLenum type, GLboolean normalized, GLsizei stride, const void *pointer);
+#undef glVertexAttribIPointer
+extern "C" void APIENTRY glVertexAttribIPointer(GLuint index, GLint size, GLenum type, GLsizei stride, const void *pointer);
+#undef glVertexAttribLPointer
+extern "C" void APIENTRY glVertexAttribLPointer(GLuint index, GLint size, GLenum type, GLsizei stride, const void *pointer);
 #undef glViewport
 extern "C" void APIENTRY glViewport(GLint x, GLint y, GLsizei width, GLsizei height);
 #undef glViewportArrayv

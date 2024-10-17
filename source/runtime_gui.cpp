@@ -5,50 +5,86 @@
 
 #if RESHADE_GUI
 
+#include "runtime.hpp"
+#include "runtime_internal.hpp"
 #include "version.h"
 #include "dll_log.hpp"
 #include "dll_resources.hpp"
 #include "ini_file.hpp"
 #include "addon_manager.hpp"
-#include "runtime.hpp"
-#include "runtime_objects.hpp"
 #include "input.hpp"
 #include "input_gamepad.hpp"
 #include "imgui_widgets.hpp"
-#include "process_utils.hpp"
+#include "localization.hpp"
+#include "platform_utils.hpp"
 #include "fonts/forkawesome.inl"
-#include <fstream>
-#include <algorithm>
+#include "fonts/glyph_ranges.hpp"
+#include <cmath> // std::abs, std::ceil, std::floor
+#include <cctype> // std::tolower
+#include <cstdlib> // std::lldiv, std::strtol
+#include <cstring> // std::memcmp, std::memcpy
+#include <algorithm> // std::any_of, std::count_if, std::find, std::find_if, std::max, std::min, std::replace, std::rotate, std::search, std::swap, std::transform
 
-static bool filter_text(const std::string_view &text, const std::string_view &filter)
+static bool filter_text(const std::string_view text, const std::string_view filter)
 {
 	return filter.empty() ||
-		std::search(text.begin(), text.end(), filter.begin(), filter.end(),
+		std::search(text.cbegin(), text.cend(), filter.cbegin(), filter.cend(),
 			[](const char c1, const char c2) { // Search case-insensitive
 				return (('a' <= c1 && c1 <= 'z') ? static_cast<char>(c1 - ' ') : c1) == (('a' <= c2 && c2 <= 'z') ? static_cast<char>(c2 - ' ') : c2);
-			}) != text.end();
+			}) != text.cend();
+}
+static auto filter_name(ImGuiInputTextCallbackData *data) -> int
+{
+	// A file name cannot contain any of the following characters
+	return data->EventChar == L'\"' || data->EventChar == L'*' || data->EventChar == L'/' || data->EventChar == L':' || data->EventChar == L'<' || data->EventChar == L'>' || data->EventChar == L'?' || data->EventChar == L'\\' || data->EventChar == L'|';
 }
 
 template <typename F>
-static void parse_errors(const std::string_view &errors, F &&callback)
+static void parse_errors(const std::string_view errors, F &&callback)
 {
-	for (size_t offset = 0, next; offset != std::string::npos; offset = next)
+	for (size_t offset = 0, next; offset != std::string_view::npos; offset = next)
 	{
 		const size_t pos_error = errors.find(": ", offset);
-		const size_t pos_error_line = errors.rfind('(', pos_error); // Paths can contain '(', but no ": ", so search backwards from th error location to find the line info
-		if (pos_error == std::string::npos || pos_error_line == std::string::npos)
+		const size_t pos_error_line = errors.rfind('(', pos_error); // Paths can contain '(', but no ": ", so search backwards from the error location to find the line info
+		if (pos_error == std::string_view::npos || pos_error_line == std::string_view::npos || pos_error_line < offset)
 			break;
 
 		const size_t pos_linefeed = errors.find('\n', pos_error);
 
-		next = pos_linefeed != std::string::npos ? pos_linefeed + 1 : std::string::npos;
+		next = pos_linefeed != std::string_view::npos ? pos_linefeed + 1 : std::string_view::npos;
 
-		const std::string error_file(errors.data() + offset, pos_error_line - offset);
-		int error_line = std::strtol(errors.data() + pos_error_line + 1, nullptr, 10);
-		const std::string error_text(errors.substr(pos_error + 2 /* skip space */, pos_linefeed - pos_error - 2));
+		const std::string_view error_file = errors.substr(offset, pos_error_line - offset);
+		int error_line = static_cast<int>(std::strtol(errors.data() + pos_error_line + 1, nullptr, 10));
+		const std::string_view error_text = errors.substr(pos_error + 2 /* skip space */, pos_linefeed - pos_error - 2);
 
 		callback(error_file, error_line, error_text);
 	}
+}
+
+template <typename T>
+static std::string_view get_localized_annotation(T &object, const std::string_view ann_name, [[maybe_unused]] std::string language)
+{
+#if RESHADE_LOCALIZATION
+	if (language.size() >= 2)
+	{
+		// Transform language name from e.g. 'en-US' to 'en_us'
+		std::replace(language.begin(), language.end(), '-', '_');
+		std::transform(language.begin(), language.end(), language.begin(),
+			[](std::string::value_type c) {
+				return static_cast<std::string::value_type>(std::tolower(c));
+			});
+
+		for (int attempt = 0; attempt < 2; ++attempt)
+		{
+			const std::string_view localized_result = object.annotation_as_string(std::string(ann_name) + '_' + language);
+			if (!localized_result.empty())
+				return localized_result;
+			else if (attempt == 0)
+				language.erase(2); // Remove location information from language name, so that it e.g. becomes 'en'
+		}
+	}
+#endif
+	return object.annotation_as_string(ann_name);
 }
 
 static const ImVec4 COLOR_RED = ImColor(240, 100, 100);
@@ -62,31 +98,11 @@ void reshade::runtime::init_gui()
 	_overlay_key_data[2] = false;
 	_overlay_key_data[3] = false;
 
+	ImGuiContext *const backup_context = ImGui::GetCurrentContext();
 	_imgui_context = ImGui::CreateContext();
 
 	ImGuiIO &imgui_io = _imgui_context->IO;
 	imgui_io.IniFilename = nullptr;
-	imgui_io.KeyMap[ImGuiKey_Tab] = 0x09; // VK_TAB
-	imgui_io.KeyMap[ImGuiKey_LeftArrow] = 0x25; // VK_LEFT
-	imgui_io.KeyMap[ImGuiKey_RightArrow] = 0x27; // VK_RIGHT
-	imgui_io.KeyMap[ImGuiKey_UpArrow] = 0x26; // VK_UP
-	imgui_io.KeyMap[ImGuiKey_DownArrow] = 0x28; // VK_DOWN
-	imgui_io.KeyMap[ImGuiKey_PageUp] = 0x21; // VK_PRIOR
-	imgui_io.KeyMap[ImGuiKey_PageDown] = 0x22; // VK_NEXT
-	imgui_io.KeyMap[ImGuiKey_Home] = 0x24; // VK_HOME
-	imgui_io.KeyMap[ImGuiKey_End] = 0x23; // VK_END
-	imgui_io.KeyMap[ImGuiKey_Insert] = 0x2D; // VK_INSERT
-	imgui_io.KeyMap[ImGuiKey_Delete] = 0x2E; // VK_DELETE
-	imgui_io.KeyMap[ImGuiKey_Backspace] = 0x08; // VK_BACK
-	imgui_io.KeyMap[ImGuiKey_Space] = 0x20; // VK_SPACE
-	imgui_io.KeyMap[ImGuiKey_Enter] = 0x0D; // VK_RETURN
-	imgui_io.KeyMap[ImGuiKey_Escape] = 0x1B; // VK_ESCAPE
-	imgui_io.KeyMap[ImGuiKey_A] = 'A';
-	imgui_io.KeyMap[ImGuiKey_C] = 'C';
-	imgui_io.KeyMap[ImGuiKey_V] = 'V';
-	imgui_io.KeyMap[ImGuiKey_X] = 'X';
-	imgui_io.KeyMap[ImGuiKey_Y] = 'Y';
-	imgui_io.KeyMap[ImGuiKey_Z] = 'Z';
 	imgui_io.ConfigFlags = ImGuiConfigFlags_DockingEnable | ImGuiConfigFlags_NavEnableKeyboard;
 	imgui_io.BackendFlags = ImGuiBackendFlags_HasMouseCursors | ImGuiBackendFlags_RendererHasVtxOffset;
 
@@ -99,7 +115,8 @@ void reshade::runtime::init_gui()
 	imgui_style.WindowRounding = 0.0f;
 	imgui_style.WindowBorderSize = 0.0f;
 
-	ImGui::SetCurrentContext(nullptr);
+	// Restore previous context in case this was called from a new runtime being created from an add-on event triggered by an existing runtime
+	ImGui::SetCurrentContext(backup_context);
 }
 void reshade::runtime::deinit_gui()
 {
@@ -109,57 +126,191 @@ void reshade::runtime::deinit_gui()
 void reshade::runtime::build_font_atlas()
 {
 	ImFontAtlas *const atlas = _imgui_context->IO.Fonts;
+
+	if (atlas->IsBuilt())
+		return;
+
+	ImGuiContext *const backup_context = ImGui::GetCurrentContext();
+	ImGui::SetCurrentContext(_imgui_context);
+
 	// Remove any existing fonts from atlas first
 	atlas->Clear();
 
-	for (int i = 0; i < 2; ++i)
+	std::error_code ec;
+	const ImWchar *glyph_ranges = nullptr;
+	std::filesystem::path resolved_font_path;
+
+#if RESHADE_LOCALIZATION
+	std::string language = _selected_language;
+	if (language.empty())
+		language = resources::get_current_language();
+
+	if (language.find("bg") == 0 || language.find("ru") == 0)
 	{
-		ImFontConfig cfg;
-		cfg.SizePixels = static_cast<float>(i == 0 ? _font_size : _editor_font_size);
+		glyph_ranges = atlas->GetGlyphRangesCyrillic();
 
-		const std::filesystem::path &font_path = (i == 0) ? _font : _editor_font;
+		_default_font_path = L"C:\\Windows\\Fonts\\calibri.ttf";
+	}
+	else
+	if (language.find("ja") == 0)
+	{
+		glyph_ranges = atlas->GetGlyphRangesJapanese();
 
-		std::error_code ec;
-		if (!std::filesystem::is_regular_file(font_path, ec) || !atlas->AddFontFromFileTTF(font_path.u8string().c_str(), cfg.SizePixels))
-			atlas->AddFontDefault(&cfg); // Use default font if custom font failed to load or does not exist
+		// Morisawa BIZ UDGothic Regular, available since Windows 10 October 2018 Update (1809) Build 17763.1
+		_default_font_path = L"C:\\Windows\\Fonts\\BIZ-UDGothicR.ttc";
+		if (!std::filesystem::exists(_default_font_path, ec))
+			_default_font_path = L"C:\\Windows\\Fonts\\msgothic.ttc"; // MS Gothic
+	}
+	else
+	if (language.find("ko") == 0)
+	{
+		glyph_ranges = atlas->GetGlyphRangesKorean();
 
-		if (i == 0)
-		{
-			// Merge icons into main font
-			ImFontConfig icon_config;
-			icon_config.MergeMode = true;
-			icon_config.PixelSnapH = true;
-			icon_config.GlyphOffset = ImVec2(0.0f, 0.1f * _font_size);
-			constexpr ImWchar icon_ranges[] = { ICON_MIN_FK, ICON_MAX_FK, 0 }; // Zero-terminated list
+		_default_font_path = L"C:\\Windows\\Fonts\\malgun.ttf"; // Malgun Gothic
+	}
+	else
+	if (language.find("zh") == 0)
+	{
+		glyph_ranges = GetGlyphRangesChineseSimplifiedGB2312();
 
-			atlas->AddFontFromMemoryCompressedBase85TTF(FONT_ICON_BUFFER_NAME_FK, cfg.SizePixels, &icon_config, icon_ranges);
-		}
+		_default_font_path = L"C:\\Windows\\Fonts\\msyh.ttc"; // Microsoft YaHei
+		if (!std::filesystem::exists(_default_font_path, ec))
+			_default_font_path = L"C:\\Windows\\Fonts\\simsun.ttc"; // SimSun
+	}
+	else
+#endif
+	{
+		glyph_ranges = atlas->GetGlyphRangesDefault();
+
+		_default_font_path.clear();
 	}
 
-	// If unable to build font atlas due to an invalid font, revert to the default font
-	if (!atlas->Build())
-	{
-		LOG(ERROR) << "Failed to build front atlas!";
+	const auto add_font_from_file = [atlas](std::filesystem::path &font_path, ImFontConfig cfg, const ImWchar *glyph_ranges, std::error_code &ec) -> bool {
+		if (font_path.empty())
+			return true;
 
-		_font.clear();
-		_editor_font.clear();
+		extern bool resolve_path(std::filesystem::path &path, std::error_code &ec);
+		if (!resolve_path(font_path, ec))
+			return false;
+
+		if (FILE *const file = _wfsopen(font_path.c_str(), L"rb", SH_DENYNO))
+		{
+			fseek(file, 0, SEEK_END);
+			const size_t data_size = ftell(file);
+			fseek(file, 0, SEEK_SET);
+
+			void *data = IM_ALLOC(data_size);
+			const size_t data_size_read = fread(data, 1, data_size, file);
+			fclose(file);
+			if (data_size_read != data_size)
+			{
+				IM_FREE(data);
+				return false;
+			}
+
+			ImFormatString(cfg.Name, IM_ARRAYSIZE(cfg.Name), "%s, %.0fpx", font_path.stem().u8string().c_str(), cfg.SizePixels);
+
+			return atlas->AddFontFromMemoryTTF(data, static_cast<int>(data_size), cfg.SizePixels, &cfg, glyph_ranges) != nullptr;
+		}
+
+		return false;
+	};
+
+	ImFontConfig cfg;
+	cfg.GlyphOffset.y = std::floor(_font_size / 13.0f); // Not used in AddFontDefault()
+	cfg.SizePixels = static_cast<float>(_font_size);
+
+#if RESHADE_LOCALIZATION
+	// Add latin font
+	resolved_font_path = _latin_font_path;
+	if (!_default_font_path.empty())
+	{
+		if (!add_font_from_file(resolved_font_path, cfg, atlas->GetGlyphRangesDefault(), ec))
+		{
+			log::message(log::level::error, "Failed to load latin font from '%s' with error code %d!", resolved_font_path.u8string().c_str(), ec.value());
+			resolved_font_path.clear();
+		}
+
+		if (resolved_font_path.empty())
+			atlas->AddFontDefault(&cfg);
+
+		cfg.MergeMode = true;
+	}
+#endif
+
+	// Add main font
+	resolved_font_path = _font_path.empty() ? _default_font_path : _font_path;
+	{
+		if (!add_font_from_file(resolved_font_path, cfg, glyph_ranges, ec))
+		{
+			log::message(log::level::error, "Failed to load font from '%s' with error code %d!", resolved_font_path.u8string().c_str(), ec.value());
+			resolved_font_path.clear();
+		}
+
+		// Use default font if custom font failed to load
+		if (resolved_font_path.empty())
+			atlas->AddFontDefault(&cfg);
+
+		// Merge icons into main font
+		cfg.MergeMode = true;
+		cfg.PixelSnapH = true;
+
+		// This need to be static so that it doesn't fall out of scope before the atlas is built below
+		static constexpr ImWchar icon_ranges[] = { ICON_MIN_FK, ICON_MAX_FK, 0 }; // Zero-terminated list
+
+		atlas->AddFontFromMemoryCompressedBase85TTF(FONT_ICON_BUFFER_NAME_FK, cfg.SizePixels, &cfg, icon_ranges);
+	}
+
+	// Add editor font
+	resolved_font_path = _editor_font_path.empty() ? _default_editor_font_path : _editor_font_path;
+	if (resolved_font_path != _font_path || _editor_font_size != _font_size)
+	{
+		cfg = ImFontConfig();
+		cfg.SizePixels = static_cast<float>(_editor_font_size);
+
+		if (!add_font_from_file(resolved_font_path, cfg, glyph_ranges, ec))
+		{
+			log::message(log::level::error, "Failed to load editor font from '%s' with error code %d!", resolved_font_path.u8string().c_str(), ec.value());
+			resolved_font_path.clear();
+		}
+
+		if (resolved_font_path.empty())
+			atlas->AddFontDefault(&cfg);
+	}
+
+	if (atlas->Build())
+	{
+#if RESHADE_VERBOSE_LOG
+		log::message(log::level::debug, "Font atlas size: %dx%d", atlas->TexWidth, atlas->TexHeight);
+#endif
+	}
+	else
+	{
+		log::message(log::level::error, "Failed to build font atlas!");
+
+		_font_path.clear();
+		_latin_font_path.clear();
+		_editor_font_path.clear();
 
 		atlas->Clear();
 
-		for (int i = 0; i < 2; ++i)
+		// If unable to build font atlas due to an invalid custom font, revert to the default font
+		for (int i = 0; i < (_editor_font_size != _font_size ? 2 : 1); ++i)
 		{
-			ImFontConfig cfg;
+			cfg = ImFontConfig();
 			cfg.SizePixels = static_cast<float>(i == 0 ? _font_size : _editor_font_size);
 
 			atlas->AddFontDefault(&cfg);
 		}
 	}
 
+	ImGui::SetCurrentContext(backup_context);
+
 	_show_splash = true;
-	_rebuild_font_atlas = false;
 
 	int width, height;
 	unsigned char *pixels;
+	// This will also build the font atlas again if that previously failed above
 	atlas->GetTexDataAsRGBA32(&pixels, &width, &height);
 
 	// Make sure font atlas is not currently in use before destroying it
@@ -177,12 +328,16 @@ void reshade::runtime::build_font_atlas()
 			api::resource_desc(width, height, 1, 1, api::format::r8g8b8a8_unorm, 1, api::memory_heap::gpu_only, api::resource_usage::shader_resource),
 			&initial_data, api::resource_usage::shader_resource, &_font_atlas_tex))
 	{
-		LOG(ERROR) << "Failed to create front atlas resource!";
+		log::message(log::level::error, "Failed to create front atlas resource!");
 		return;
 	}
+
+	// Texture data is now uploaded, so can free the memory
+	atlas->ClearTexData();
+
 	if (!_device->create_resource_view(_font_atlas_tex, api::resource_usage::shader_resource, api::resource_view_desc(api::format::r8g8b8a8_unorm), &_font_atlas_srv))
 	{
-		LOG(ERROR) << "Failed to create font atlas resource view!";
+		log::message(log::level::error, "Failed to create font atlas resource view!");
 		return;
 	}
 
@@ -196,9 +351,22 @@ void reshade::runtime::load_config_gui(const ini_file &config)
 	else
 		_imgui_context->IO.ConfigFlags &= ~ImGuiConfigFlags_NavEnableGamepad;
 
-	config.get("INPUT", "KeyOverlay", _overlay_key_data);
-	config.get("INPUT", "InputProcessing", _input_processing_mode);
+	const auto config_get = [&config](const std::string &section, const std::string &key, auto &values) {
+		if (config.get(section, key, values))
+			return true;
+		// Fall back to global configuration when an entry does not exist in the local configuration
+		return global_config().get(section, key, values);
+	};
+
+	config_get("INPUT", "KeyOverlay", _overlay_key_data);
+	config_get("INPUT", "KeyFPS", _fps_key_data);
+	config_get("INPUT", "KeyFrameTime", _frametime_key_data);
+	config_get("INPUT", "InputProcessing", _input_processing_mode);
 	config.get("NFSMW", "ToggleFrontend", _toggle_fe_key_data);
+
+#if RESHADE_LOCALIZATION
+	config_get("OVERLAY", "Language", _selected_language);
+#endif
 
 	config.get("OVERLAY", "ClockFormat", _clock_format);
 	config.get("OVERLAY", "FPSPosition", _fps_pos);
@@ -209,31 +377,37 @@ void reshade::runtime::load_config_gui(const ini_file &config)
 #endif
 	config.get("OVERLAY", "ShowFPS", _show_fps);
 	config.get("OVERLAY", "ShowFrameTime", _show_frametime);
+	config.get("OVERLAY", "ShowPresetName", _show_preset_name);
 	config.get("OVERLAY", "ShowScreenshotMessage", _show_screenshot_message);
 #if RESHADE_FX
-	config.get("OVERLAY", "TutorialProgress", _tutorial_index);
+	if (!global_config().get("OVERLAY", "TutorialProgress", _tutorial_index))
+		config.get("OVERLAY", "TutorialProgress", _tutorial_index);
 	config.get("OVERLAY", "VariableListHeight", _variable_editor_height);
 	config.get("OVERLAY", "VariableListUseTabs", _variable_editor_tabs);
-	config.get("OVERLAY", "SavePresetOnModification", _save_present_on_modification);
+	config.get("OVERLAY", "AutoSavePreset", _auto_save_preset);
+	config.get("OVERLAY", "ShowPresetTransitionMessage", _show_preset_transition_message);
 #endif
 
 	ImGuiStyle &imgui_style = _imgui_context->Style;
 	config.get("STYLE", "Alpha", imgui_style.Alpha);
 	config.get("STYLE", "ChildRounding", imgui_style.ChildRounding);
 	config.get("STYLE", "ColFPSText", _fps_col);
-	config.get("STYLE", "EditorFont", _editor_font);
+	config.get("STYLE", "EditorFont", _editor_font_path);
 	config.get("STYLE", "EditorFontSize", _editor_font_size);
 	config.get("STYLE", "EditorStyleIndex", _editor_style_index);
-	config.get("STYLE", "Font", _font);
+	config.get("STYLE", "Font", _font_path);
 	config.get("STYLE", "FontSize", _font_size);
 	config.get("STYLE", "FPSScale", _fps_scale);
 	config.get("STYLE", "FrameRounding", imgui_style.FrameRounding);
 	config.get("STYLE", "GrabRounding", imgui_style.GrabRounding);
+	config.get("STYLE", "LatinFont", _latin_font_path);
 	config.get("STYLE", "PopupRounding", imgui_style.PopupRounding);
 	config.get("STYLE", "ScrollbarRounding", imgui_style.ScrollbarRounding);
 	config.get("STYLE", "StyleIndex", _style_index);
 	config.get("STYLE", "TabRounding", imgui_style.TabRounding);
 	config.get("STYLE", "WindowRounding", imgui_style.WindowRounding);
+	config.get("STYLE", "HdrOverlayBrightness", _hdr_overlay_brightness);
+	config.get("STYLE", "HdrOverlayOverwriteColorSpaceTo", reinterpret_cast<int &>(_hdr_overlay_overwrite_color_space));
 
 	// For compatibility with older versions, set the alpha value if it is missing
 	if (_fps_col[3] == 0.0f)
@@ -254,8 +428,8 @@ void reshade::runtime::load_config_gui(const ini_file &config)
 
 	for (ImGuiSettingsHandler &handler : _imgui_context->SettingsHandlers)
 	{
-		std::vector<std::string> lines;
-		if (config.get("OVERLAY", handler.TypeName, lines))
+		if (std::vector<std::string> lines;
+			config.get("OVERLAY", handler.TypeName, lines))
 		{
 			void *entry_data = nullptr;
 
@@ -291,43 +465,54 @@ void reshade::runtime::load_config_gui(const ini_file &config)
 void reshade::runtime::save_config_gui(ini_file &config) const
 {
 	config.set("INPUT", "KeyOverlay", _overlay_key_data);
+	config.set("INPUT", "KeyFPS", _fps_key_data);
+	config.set("INPUT", "KeyFrametime", _frametime_key_data);
 	config.set("INPUT", "InputProcessing", _input_processing_mode);
 	config.set("NFSMW", "ToggleFrontend", _toggle_fe_key_data);
 
+#if RESHADE_LOCALIZATION
+	config.set("OVERLAY", "Language", _selected_language);
+#endif
+
 	config.set("OVERLAY", "ClockFormat", _clock_format);
 	config.set("OVERLAY", "FPSPosition", _fps_pos);
-	config.set("OVERLAY", "NoFontScaling", _no_font_scaling);
 	config.set("OVERLAY", "ShowClock", _show_clock);
 #if RESHADE_FX
 	config.set("OVERLAY", "ShowForceLoadEffectsButton", _show_force_load_effects_button);
 #endif
 	config.set("OVERLAY", "ShowFPS", _show_fps);
 	config.set("OVERLAY", "ShowFrameTime", _show_frametime);
+	config.set("OVERLAY", "ShowPresetName", _show_preset_name);
 	config.set("OVERLAY", "ShowScreenshotMessage", _show_screenshot_message);
 #if RESHADE_FX
+	global_config().set("OVERLAY", "TutorialProgress", _tutorial_index);
 	config.set("OVERLAY", "TutorialProgress", _tutorial_index);
 	config.set("OVERLAY", "VariableListHeight", _variable_editor_height);
 	config.set("OVERLAY", "VariableListUseTabs", _variable_editor_tabs);
-	config.set("OVERLAY", "SavePresetOnModification", _save_present_on_modification);
+	config.set("OVERLAY", "AutoSavePreset", _auto_save_preset);
+	config.set("OVERLAY", "ShowPresetTransitionMessage", _show_preset_transition_message);
 #endif
 
 	const ImGuiStyle &imgui_style = _imgui_context->Style;
 	config.set("STYLE", "Alpha", imgui_style.Alpha);
 	config.set("STYLE", "ChildRounding", imgui_style.ChildRounding);
 	config.set("STYLE", "ColFPSText", _fps_col);
-	config.set("STYLE", "EditorFont", _editor_font);
+	config.set("STYLE", "EditorFont", _editor_font_path);
 	config.set("STYLE", "EditorFontSize", _editor_font_size);
 	config.set("STYLE", "EditorStyleIndex", _editor_style_index);
-	config.set("STYLE", "Font", _font);
+	config.set("STYLE", "Font", _font_path);
 	config.set("STYLE", "FontSize", _font_size);
 	config.set("STYLE", "FPSScale", _fps_scale);
 	config.set("STYLE", "FrameRounding", imgui_style.FrameRounding);
 	config.set("STYLE", "GrabRounding", imgui_style.GrabRounding);
+	config.set("STYLE", "LatinFont", _latin_font_path);
 	config.set("STYLE", "PopupRounding", imgui_style.PopupRounding);
 	config.set("STYLE", "ScrollbarRounding", imgui_style.ScrollbarRounding);
 	config.set("STYLE", "StyleIndex", _style_index);
 	config.set("STYLE", "TabRounding", imgui_style.TabRounding);
 	config.set("STYLE", "WindowRounding", imgui_style.WindowRounding);
+	config.set("STYLE", "HdrOverlayBrightness", _hdr_overlay_brightness);
+	config.set("STYLE", "HdrOverlayOverwriteColorSpaceTo", static_cast<int>(_hdr_overlay_overwrite_color_space));
 
 	// Do not save custom style colors by default, only when actually used and edited
 
@@ -648,12 +833,23 @@ void reshade::runtime::draw_gui()
 {
 	assert(_is_initialized);
 
+	bool show_overlay = _show_overlay;
+	api::input_source show_overlay_source = api::input_source::keyboard;
+
 	if (_input != nullptr)
 	{
 		if (_show_overlay && !_ignore_shortcuts && !_imgui_context->IO.NavVisible && _input->is_key_pressed(0x1B /* VK_ESCAPE */))
-			_show_overlay = false; // Close when pressing the escape button and not currently navigating with the keyboard
+			show_overlay = false; // Close when pressing the escape button and not currently navigating with the keyboard
 		else if (!_ignore_shortcuts && _input->is_key_pressed(_overlay_key_data, _force_shortcut_modifiers) && _imgui_context->ActiveId == 0)
-			_show_overlay = !_show_overlay;
+			show_overlay = !_show_overlay;
+
+		if (!_ignore_shortcuts)
+		{
+			if (_input->is_key_pressed(_fps_key_data, _force_shortcut_modifiers))
+				_show_fps = _show_fps ? 0 : 1;
+			if (_input->is_key_pressed(_frametime_key_data, _force_shortcut_modifiers))
+				_show_frametime = _show_frametime ? 0 : 1;
+		}
 	}
 
 	if (_input_gamepad != nullptr)
@@ -662,33 +858,56 @@ void reshade::runtime::draw_gui()
 			_input_gamepad->is_button_down(input_gamepad::button_right_shoulder) &&
 			_input_gamepad->is_button_pressed(input_gamepad::button_start))
 		{
-			_show_overlay = !_show_overlay;
-			_imgui_context->NavInputSource = ImGuiInputSource_Gamepad;
+			show_overlay = !_show_overlay;
+			show_overlay_source = api::input_source::gamepad;
 		}
 	}
 
+	if (show_overlay != _show_overlay)
+		open_overlay(show_overlay, show_overlay_source);
+
 #if RESHADE_FX
-	bool show_splash = _show_splash && (is_loading() || (_reload_count <= 1 && (_last_present_time - _last_reload_time) < std::chrono::seconds(5)) || (!_show_overlay && _tutorial_index == 0));
+	const bool show_splash_window = _show_splash && (is_loading() || (_reload_count <= 1 && (_last_present_time - _last_reload_time) < std::chrono::seconds(5)) || (!_show_overlay && _tutorial_index == 0 && _input != nullptr));
 #else
-	bool show_splash = _show_splash && (_last_present_time - _last_reload_time) < std::chrono::seconds(5);
+	const bool show_splash_window = _show_splash && (_last_present_time - _last_reload_time) < std::chrono::seconds(5);
 #endif
+
+	// Do not show this message in the same frame the screenshot is taken (so that it won't show up on the GUI screenshot)
+	const bool show_screenshot_message = (_show_screenshot_message || !_last_screenshot_save_successful) && !_should_save_screenshot && (_last_present_time - _last_screenshot_time) < std::chrono::seconds(_last_screenshot_save_successful ? 3 : 5);
+#if RESHADE_FX
+	const bool show_preset_transition_message = _show_preset_transition_message && _is_in_preset_transition;
+#else
+	const bool show_preset_transition_message = false;
+#endif
+	const bool show_message_window = show_screenshot_message || show_preset_transition_message || !_preset_save_successful;
 
 	const bool show_clock = _show_clock == 1 || (_show_overlay && _show_clock > 1);
 	const bool show_fps = _show_fps == 1 || (_show_overlay && _show_fps > 1);
 	const bool show_frametime = _show_frametime == 1 || (_show_overlay && _show_frametime > 1);
-	const bool show_stats_window = show_clock || show_fps || show_frametime;
-	// Do not show this message in the same frame the screenshot is taken (so that it won't show up on the GUI screenshot)
-	const bool show_screenshot_message = (_show_screenshot_message || !_last_screenshot_save_successfull) && !_should_save_screenshot && (_last_present_time - _last_screenshot_time) < std::chrono::seconds(_last_screenshot_save_successfull ? 3 : 5);
-	if (show_screenshot_message || !_preset_save_successfull)
-		show_splash = true;
+	const bool show_preset_name = _show_preset_name == 1 || (_show_overlay && _show_preset_name > 1);
+	bool show_statistics_window = show_clock || show_fps || show_frametime || show_preset_name;
+#if RESHADE_ADDON
+	for (const addon_info &info : addon_loaded_info)
+	{
+		for (const addon_info::overlay_callback &widget : info.overlay_callbacks)
+		{
+			if (widget.title == "OSD")
+			{
+				show_statistics_window = true;
+				break;
+			}
+		}
+	}
+#endif
 
 	_ignore_shortcuts = false;
+	_block_input_next_frame = false;
 #if RESHADE_FX
 	_gather_gpu_statistics = false;
 	_effects_expanded_state &= 2;
 #endif
 
-	if (!show_splash && !show_stats_window && !_show_overlay
+	if (!show_splash_window && !show_message_window && !show_statistics_window && !_show_overlay
 #if RESHADE_FX
 		&& _preview_texture == 0
 #endif
@@ -705,8 +924,7 @@ void reshade::runtime::draw_gui()
 		return; // Early-out to avoid costly ImGui calls when no GUI elements are on the screen
 	}
 
-	if (_rebuild_font_atlas)
-		build_font_atlas();
+	build_font_atlas();
 	if (_font_atlas_srv == 0)
 		return; // Cannot render GUI without font atlas
 
@@ -726,22 +944,130 @@ void reshade::runtime::draw_gui()
 		// Scale mouse position in case render resolution does not match the window size
 		unsigned int max_position[2];
 		_input->max_mouse_position(max_position);
-		imgui_io.MousePos.x = _input->mouse_position_x() * (imgui_io.DisplaySize.x / max_position[0]);
-		imgui_io.MousePos.y = _input->mouse_position_y() * (imgui_io.DisplaySize.y / max_position[1]);
+		imgui_io.AddMousePosEvent(
+			_input->mouse_position_x() * (imgui_io.DisplaySize.x / max_position[0]),
+			_input->mouse_position_y() * (imgui_io.DisplaySize.y / max_position[1]));
 
 		// Add wheel delta to the current absolute mouse wheel position
-		imgui_io.MouseWheel += _input->mouse_wheel_delta();
+		imgui_io.AddMouseWheelEvent(0.0f, _input->mouse_wheel_delta());
 
 		// Update all the button states
-		imgui_io.KeyAlt = _input->is_key_down(0x12); // VK_MENU
-		imgui_io.KeyCtrl = _input->is_key_down(0x11); // VK_CONTROL
-		imgui_io.KeyShift = _input->is_key_down(0x10); // VK_SHIFT
-		for (unsigned int i = 0; i < 256; i++)
-			imgui_io.KeysDown[i] = _input->is_key_down(i);
-		for (unsigned int i = 0; i < 5; i++)
-			imgui_io.MouseDown[i] = _input->is_mouse_button_down(i);
-		for (wchar_t c : _input->text_input())
-			imgui_io.AddInputCharacter(c);
+		constexpr std::pair<ImGuiKey, unsigned int> key_mappings[] = {
+			{ ImGuiKey_Tab, 0x09 /* VK_TAB */ },
+			{ ImGuiKey_LeftArrow, 0x25 /* VK_LEFT */ },
+			{ ImGuiKey_RightArrow, 0x27 /* VK_RIGHT */ },
+			{ ImGuiKey_UpArrow, 0x26 /* VK_UP */ },
+			{ ImGuiKey_DownArrow, 0x28 /* VK_DOWN */ },
+			{ ImGuiKey_PageUp, 0x21 /* VK_PRIOR */ },
+			{ ImGuiKey_PageDown, 0x22 /* VK_NEXT */ },
+			{ ImGuiKey_End, 0x23 /* VK_END */ },
+			{ ImGuiKey_Home, 0x24 /* VK_HOME */ },
+			{ ImGuiKey_Insert, 0x2D /* VK_INSERT */ },
+			{ ImGuiKey_Delete, 0x2E /* VK_DELETE */ },
+			{ ImGuiKey_Backspace, 0x08 /* VK_BACK */ },
+			{ ImGuiKey_Space, 0x20 /* VK_SPACE */ },
+			{ ImGuiKey_Enter, 0x0D /* VK_RETURN */ },
+			{ ImGuiKey_Escape, 0x1B /* VK_ESCAPE */ },
+			{ ImGuiKey_LeftCtrl, 0xA2 /* VK_LCONTROL */ },
+			{ ImGuiKey_LeftShift, 0xA0 /* VK_LSHIFT */ },
+			{ ImGuiKey_LeftAlt, 0xA4 /* VK_LMENU */ },
+			{ ImGuiKey_LeftSuper, 0x5B /* VK_LWIN */ },
+			{ ImGuiKey_RightCtrl, 0xA3 /* VK_RCONTROL */ },
+			{ ImGuiKey_RightShift, 0xA1 /* VK_RSHIFT */ },
+			{ ImGuiKey_RightAlt, 0xA5 /* VK_RMENU */ },
+			{ ImGuiKey_RightSuper, 0x5C /* VK_RWIN */ },
+			{ ImGuiKey_Menu, 0x5D /* VK_APPS */ },
+			{ ImGuiKey_0, '0' },
+			{ ImGuiKey_1, '1' },
+			{ ImGuiKey_2, '2' },
+			{ ImGuiKey_3, '3' },
+			{ ImGuiKey_4, '4' },
+			{ ImGuiKey_5, '5' },
+			{ ImGuiKey_6, '6' },
+			{ ImGuiKey_7, '7' },
+			{ ImGuiKey_8, '8' },
+			{ ImGuiKey_9, '9' },
+			{ ImGuiKey_A, 'A' },
+			{ ImGuiKey_B, 'B' },
+			{ ImGuiKey_C, 'C' },
+			{ ImGuiKey_D, 'D' },
+			{ ImGuiKey_E, 'E' },
+			{ ImGuiKey_F, 'F' },
+			{ ImGuiKey_G, 'G' },
+			{ ImGuiKey_H, 'H' },
+			{ ImGuiKey_I, 'I' },
+			{ ImGuiKey_J, 'J' },
+			{ ImGuiKey_K, 'K' },
+			{ ImGuiKey_L, 'L' },
+			{ ImGuiKey_M, 'M' },
+			{ ImGuiKey_N, 'N' },
+			{ ImGuiKey_O, 'O' },
+			{ ImGuiKey_P, 'P' },
+			{ ImGuiKey_Q, 'Q' },
+			{ ImGuiKey_R, 'R' },
+			{ ImGuiKey_S, 'S' },
+			{ ImGuiKey_T, 'T' },
+			{ ImGuiKey_U, 'U' },
+			{ ImGuiKey_V, 'V' },
+			{ ImGuiKey_W, 'W' },
+			{ ImGuiKey_X, 'X' },
+			{ ImGuiKey_Y, 'Y' },
+			{ ImGuiKey_Z, 'Z' },
+			{ ImGuiKey_F1, 0x70 /* VK_F1 */ },
+			{ ImGuiKey_F2, 0x71 /* VK_F2 */ },
+			{ ImGuiKey_F3, 0x72 /* VK_F3 */ },
+			{ ImGuiKey_F4, 0x73 /* VK_F4 */ },
+			{ ImGuiKey_F5, 0x74 /* VK_F5 */ },
+			{ ImGuiKey_F6, 0x75 /* VK_F6 */ },
+			{ ImGuiKey_F7, 0x76 /* VK_F7 */ },
+			{ ImGuiKey_F8, 0x77 /* VK_F8 */ },
+			{ ImGuiKey_F9, 0x78 /* VK_F9 */ },
+			{ ImGuiKey_F10, 0x79 /* VK_F10 */ },
+			{ ImGuiKey_F11, 0x80 /* VK_F11 */ },
+			{ ImGuiKey_F12, 0x81 /* VK_F12 */ },
+			{ ImGuiKey_Apostrophe, 0xDE /* VK_OEM_7 */ },
+			{ ImGuiKey_Comma, 0xBC /* VK_OEM_COMMA */ },
+			{ ImGuiKey_Minus, 0xBD /* VK_OEM_MINUS */ },
+			{ ImGuiKey_Period, 0xBE /* VK_OEM_PERIOD */ },
+			{ ImGuiKey_Slash, 0xBF /* VK_OEM_2 */ },
+			{ ImGuiKey_Semicolon, 0xBA /* VK_OEM_1 */ },
+			{ ImGuiKey_Equal, 0xBB /* VK_OEM_PLUS */ },
+			{ ImGuiKey_LeftBracket, 0xDB /* VK_OEM_4 */ },
+			{ ImGuiKey_Backslash, 0xDC /* VK_OEM_5 */ },
+			{ ImGuiKey_RightBracket, 0xDD /* VK_OEM_6 */ },
+			{ ImGuiKey_GraveAccent, 0xC0 /* VK_OEM_3 */ },
+			{ ImGuiKey_CapsLock, 0x14 /* VK_CAPITAL */ },
+			{ ImGuiKey_ScrollLock, 0x91 /* VK_SCROLL */ },
+			{ ImGuiKey_NumLock, 0x90 /* VK_NUMLOCK */ },
+			{ ImGuiKey_PrintScreen, 0x2C /* VK_SNAPSHOT */ },
+			{ ImGuiKey_Pause, 0x13 /* VK_PAUSE */ },
+			{ ImGuiKey_Keypad0, 0x60 /* VK_NUMPAD0 */ },
+			{ ImGuiKey_Keypad1, 0x61 /* VK_NUMPAD1 */ },
+			{ ImGuiKey_Keypad2, 0x62 /* VK_NUMPAD2 */ },
+			{ ImGuiKey_Keypad3, 0x63 /* VK_NUMPAD3 */ },
+			{ ImGuiKey_Keypad4, 0x64 /* VK_NUMPAD4 */ },
+			{ ImGuiKey_Keypad5, 0x65 /* VK_NUMPAD5 */ },
+			{ ImGuiKey_Keypad6, 0x66 /* VK_NUMPAD6 */ },
+			{ ImGuiKey_Keypad7, 0x67 /* VK_NUMPAD7 */ },
+			{ ImGuiKey_Keypad8, 0x68 /* VK_NUMPAD8 */ },
+			{ ImGuiKey_Keypad9, 0x69 /* VK_NUMPAD9 */ },
+			{ ImGuiKey_KeypadDecimal, 0x6E /* VK_DECIMAL */ },
+			{ ImGuiKey_KeypadDivide, 0x6F /* VK_DIVIDE */ },
+			{ ImGuiKey_KeypadMultiply, 0x6A /* VK_MULTIPLY */ },
+			{ ImGuiKey_KeypadSubtract, 0x6D /* VK_SUBTRACT */ },
+			{ ImGuiKey_KeypadAdd, 0x6B /* VK_ADD */ },
+			{ ImGuiMod_Ctrl, 0x11 /* VK_CONTROL */ },
+			{ ImGuiMod_Shift, 0x10 /* VK_SHIFT */ },
+			{ ImGuiMod_Alt, 0x12 /* VK_MENU */ },
+			{ ImGuiMod_Super, 0x5D /* VK_APPS */ },
+		};
+
+		for (const std::pair<ImGuiKey, unsigned int> &mapping : key_mappings)
+			imgui_io.AddKeyEvent(mapping.first, _input->is_key_down(mapping.second));
+		for (ImGuiMouseButton i = 0; i < ImGuiMouseButton_COUNT; i++)
+			imgui_io.AddMouseButtonEvent(i, _input->is_mouse_button_down(i));
+		for (ImWchar16 c : _input->text_input())
+			imgui_io.AddInputCharacterUTF16(c);
 	}
 
 	if (_input_gamepad != nullptr)
@@ -750,22 +1076,32 @@ void reshade::runtime::draw_gui()
 		{
 			imgui_io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
 
-			imgui_io.NavInputs[ImGuiNavInput_Activate] = _input_gamepad->is_button_down(input_gamepad::button_a) ? 1.0f : 0.0f;
-			imgui_io.NavInputs[ImGuiNavInput_Cancel] = _input_gamepad->is_button_down(input_gamepad::button_b) ? 1.0f : 0.0f;
-			imgui_io.NavInputs[ImGuiNavInput_Input] = _input_gamepad->is_button_down(input_gamepad::button_y) != 0 ? 1.0f : 0.0f;
-			imgui_io.NavInputs[ImGuiNavInput_Menu] = _input_gamepad->is_button_down(input_gamepad::button_x) ? 1.0f : 0.0f;
-			imgui_io.NavInputs[ImGuiNavInput_DpadLeft] = _input_gamepad->is_button_down(input_gamepad::button_dpad_left) ? 1.0f : 0.0f;
-			imgui_io.NavInputs[ImGuiNavInput_DpadRight] = _input_gamepad->is_button_down(input_gamepad::button_dpad_right) ? 1.0f : 0.0f;
-			imgui_io.NavInputs[ImGuiNavInput_DpadUp] = _input_gamepad->is_button_down(input_gamepad::button_dpad_up) ? 1.0f : 0.0f;
-			imgui_io.NavInputs[ImGuiNavInput_DpadDown] = _input_gamepad->is_button_down(input_gamepad::button_dpad_down) ? 1.0f : 0.0f;
-			imgui_io.NavInputs[ImGuiNavInput_LStickLeft] = -std::min(_input_gamepad->left_thumb_axis_x(), 0.0f);
-			imgui_io.NavInputs[ImGuiNavInput_LStickRight] = std::max(_input_gamepad->left_thumb_axis_x(), 0.0f);
-			imgui_io.NavInputs[ImGuiNavInput_LStickUp] = std::max(_input_gamepad->left_thumb_axis_y(), 0.0f);
-			imgui_io.NavInputs[ImGuiNavInput_LStickDown] = -std::min(_input_gamepad->left_thumb_axis_y(), 0.0f);
-			imgui_io.NavInputs[ImGuiNavInput_FocusPrev] = _input_gamepad->is_button_down(input_gamepad::button_left_shoulder) ? 1.0f : 0.0f;
-			imgui_io.NavInputs[ImGuiNavInput_FocusNext] = _input_gamepad->is_button_down(input_gamepad::button_right_shoulder) ? 1.0f : 0.0f;
-			imgui_io.NavInputs[ImGuiNavInput_TweakSlow] = _input_gamepad->left_trigger_position();
-			imgui_io.NavInputs[ImGuiNavInput_TweakFast] = _input_gamepad->right_trigger_position();
+			constexpr std::pair<ImGuiKey, input_gamepad::button> button_mappings[] = {
+				{ ImGuiKey_GamepadStart, input_gamepad::button_start },
+				{ ImGuiKey_GamepadBack, input_gamepad::button_back },
+				{ ImGuiKey_GamepadFaceLeft, input_gamepad::button_x },
+				{ ImGuiKey_GamepadFaceRight, input_gamepad::button_b },
+				{ ImGuiKey_GamepadFaceUp, input_gamepad::button_y },
+				{ ImGuiKey_GamepadFaceDown, input_gamepad::button_a },
+				{ ImGuiKey_GamepadDpadLeft, input_gamepad::button_dpad_left },
+				{ ImGuiKey_GamepadDpadRight, input_gamepad::button_dpad_right },
+				{ ImGuiKey_GamepadDpadUp, input_gamepad::button_dpad_up },
+				{ ImGuiKey_GamepadDpadDown, input_gamepad::button_dpad_down },
+				{ ImGuiKey_GamepadL1, input_gamepad::button_left_shoulder },
+				{ ImGuiKey_GamepadR1, input_gamepad::button_right_shoulder },
+				{ ImGuiKey_GamepadL3, input_gamepad::button_left_thumb },
+				{ ImGuiKey_GamepadR3, input_gamepad::button_right_thumb },
+			};
+
+			for (const std::pair<ImGuiKey, input_gamepad::button> &mapping : button_mappings)
+				imgui_io.AddKeyEvent(mapping.first, _input_gamepad->is_button_down(mapping.second));
+
+			imgui_io.AddKeyAnalogEvent(ImGuiKey_GamepadL2, _input_gamepad->left_trigger_position() != 0.0f, _input_gamepad->left_trigger_position());
+			imgui_io.AddKeyAnalogEvent(ImGuiKey_GamepadR2, _input_gamepad->right_trigger_position() != 0.0f, _input_gamepad->right_trigger_position());
+			imgui_io.AddKeyAnalogEvent(ImGuiKey_GamepadLStickLeft, _input_gamepad->left_thumb_axis_x() < 0.0f, -std::min(_input_gamepad->left_thumb_axis_x(), 0.0f));
+			imgui_io.AddKeyAnalogEvent(ImGuiKey_GamepadLStickRight, _input_gamepad->left_thumb_axis_x() > 0.0f, std::max(_input_gamepad->left_thumb_axis_x(), 0.0f));
+			imgui_io.AddKeyAnalogEvent(ImGuiKey_GamepadLStickUp, _input_gamepad->left_thumb_axis_y() > 0.0f, std::max(_input_gamepad->left_thumb_axis_y(), 0.0f));
+			imgui_io.AddKeyAnalogEvent(ImGuiKey_GamepadLStickDown, _input_gamepad->left_thumb_axis_y() < 0.0f, -std::min(_input_gamepad->left_thumb_axis_y(), 0.0f));
 		}
 		else
 		{
@@ -775,17 +1111,27 @@ void reshade::runtime::draw_gui()
 
 	ImGui::NewFrame();
 
+#if RESHADE_LOCALIZATION
+	const std::string prev_language = resources::set_current_language(_selected_language);
+	_current_language = resources::get_current_language();
+#endif
+
 	ImVec2 viewport_offset = ImVec2(0, 0);
+#if RESHADE_FX
+	const bool show_spinner = _reload_count > 1 && _tutorial_index != 0;
+#else
+	const bool show_spinner = false;
+#endif
 
 	// Create ImGui widgets and windows
-	if (show_splash)
+	if (show_splash_window && !(show_spinner && show_overlay))
 	{
 		ImGui::SetNextWindowPos(_imgui_context->Style.WindowPadding);
 		ImGui::SetNextWindowSize(ImVec2(imgui_io.DisplaySize.x - 20.0f, 0.0f));
 		ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 1.0f);
 		ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.862745f, 0.862745f, 0.862745f, 1.0f));
-		ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.117647f, 0.117647f, 0.117647f, 0.7f));
-		ImGui::Begin("Splash Screen", nullptr,
+		ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.117647f, 0.117647f, 0.117647f, show_spinner ? 0.0f : 0.7f));
+		ImGui::Begin("Splash Window", nullptr,
 			ImGuiWindowFlags_NoDecoration |
 			ImGuiWindowFlags_NoNav |
 			ImGuiWindowFlags_NoMove |
@@ -794,37 +1140,28 @@ void reshade::runtime::draw_gui()
 			ImGuiWindowFlags_NoDocking |
 			ImGuiWindowFlags_NoFocusOnAppearing);
 
-		if (!_preset_save_successfull)
-		{
 #if RESHADE_FX
-			ImGui::TextColored(COLOR_RED, "Unable to save configuration and/or current preset. Make sure file permissions are set up to allow writing to these paths and their parent directories:\n%s\n%s", _config_path.u8string().c_str(), _current_preset_path.u8string().c_str());
-#else
-			ImGui::TextColored(COLOR_RED, "Unable to save configuration. Make sure file permissions are set up to allow writing to %s.", _config_path.u8string().c_str());
-#endif
-		}
-		else if (show_screenshot_message)
+		if (show_spinner)
 		{
-			if (!_last_screenshot_save_successfull)
-				if (_screenshot_directory_creation_successfull)
-					ImGui::TextColored(COLOR_RED, "Unable to save screenshot because of an internal error (the format may not be supported or the drive may be full).");
-				else
-					ImGui::TextColored(COLOR_RED, "Unable to save screenshot because path could not be created: %s.", (g_reshade_base_path / _screenshot_path).u8string().c_str());
-			else
-				ImGui::Text("Screenshot successfully saved to %s", _last_screenshot_file.u8string().c_str());
+			imgui::spinner((_effects.size() - _reload_remaining_effects) / float(_effects.size()), 16.0f * _font_size / 13, 10.0f * _font_size / 13);
 		}
 		else
+#endif
 		{
 			ImGui::TextUnformatted("ReShade " VERSION_STRING_PRODUCT);
 
-			if (_needs_update)
+			if ((s_latest_version[0] > VERSION_MAJOR) ||
+				(s_latest_version[0] == VERSION_MAJOR && s_latest_version[1] > VERSION_MINOR) ||
+				(s_latest_version[0] == VERSION_MAJOR && s_latest_version[1] == VERSION_MINOR && s_latest_version[2] > VERSION_REVISION))
 			{
-				ImGui::TextColored(COLOR_YELLOW,
-					"An update is available! Please visit https://reshade.me and install the new version (v%lu.%lu.%lu).",
-					_latest_version[0], _latest_version[1], _latest_version[2]);
+				ImGui::TextColored(COLOR_YELLOW, _(
+					"An update is available! Please visit %s and install the new version (v%u.%u.%u)."),
+					"https://reshade.me",
+					s_latest_version[0], s_latest_version[1], s_latest_version[2]);
 			}
 			else
 			{
-				ImGui::TextUnformatted("Visit https://reshade.me for news, updates, effects and discussion.");
+				ImGui::Text(_("Visit %s for news, updates, effects and discussion."), "https://reshade.me");
 			}
 
 			ImGui::Spacing();
@@ -834,9 +1171,9 @@ void reshade::runtime::draw_gui()
 			{
 				ImGui::ProgressBar((_effects.size() - _reload_remaining_effects) / float(_effects.size()), ImVec2(-1, 0), "");
 				ImGui::SameLine(15);
-				ImGui::Text(
+				ImGui::Text(_(
 					"Compiling (%zu effects remaining) ... "
-					"This might take a while. The application could become unresponsive for some time.",
+					"This might take a while. The application could become unresponsive for some time."),
 					_reload_remaining_effects.load());
 			}
 			else
@@ -847,42 +1184,59 @@ void reshade::runtime::draw_gui()
 
 				if (_input == nullptr)
 				{
-					ImGui::TextColored(COLOR_YELLOW, "No keyboard or mouse input available.%s", _input_gamepad != nullptr ? " Use gamepad instead: Press 'left + right shoulder + start button' to open the configuration overlay." : "");
+					ImGui::TextColored(COLOR_YELLOW, _("No keyboard or mouse input available."));
+					if (_input_gamepad != nullptr)
+					{
+						ImGui::SameLine();
+						ImGui::TextColored(COLOR_YELLOW, _("Use gamepad instead: Press 'left + right shoulder + start button' to open the configuration overlay."));
+					}
 				}
 #if RESHADE_FX
 				else if (_tutorial_index == 0)
 				{
-					ImGui::TextUnformatted("ReShade is now installed successfully! Press '");
+					const std::string label = _("ReShade is now installed successfully! Press '%s' to start the tutorial.");
+					const size_t key_offset = label.find("%s");
+
+					ImGui::TextUnformatted(label.c_str(), label.c_str() + key_offset);
 					ImGui::SameLine(0.0f, 0.0f);
-					ImGui::TextColored(ImVec4(1, 1, 1, 1), "%s", input::key_name(_overlay_key_data).c_str());
+					ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1, 1, 1, 1));
+					ImGui::TextUnformatted(input::key_name(_overlay_key_data).c_str());
+					ImGui::PopStyleColor();
 					ImGui::SameLine(0.0f, 0.0f);
-					ImGui::TextUnformatted("' to start the tutorial.");
+					ImGui::TextUnformatted(label.c_str() + key_offset + 2, label.c_str() + label.size());
 				}
 #endif
 				else
 				{
-					ImGui::TextUnformatted("Press '");
+					const std::string label = _("Press '%s' to open the configuration overlay.");
+					const size_t key_offset = label.find("%s");
+
+					ImGui::TextUnformatted(label.c_str(), label.c_str() + key_offset);
 					ImGui::SameLine(0.0f, 0.0f);
-					ImGui::TextColored(ImVec4(1, 1, 1, 1), "%s", input::key_name(_overlay_key_data).c_str());
+					ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1, 1, 1, 1));
+					ImGui::TextUnformatted(input::key_name(_overlay_key_data).c_str());
+					ImGui::PopStyleColor();
 					ImGui::SameLine(0.0f, 0.0f);
-					ImGui::TextUnformatted("' to open the configuration overlay.");
+					ImGui::TextUnformatted(label.c_str() + key_offset + 2, label.c_str() + label.size());
 				}
 			}
 
 			std::string error_message;
 #if RESHADE_ADDON
 			if (!addon_all_loaded)
-				error_message += "loading some add-ons";
+				error_message += _("There were errors loading some add-ons."),
+				error_message += ' ';
 #endif
 #if RESHADE_FX
-			if (!_last_reload_successfull)
-				error_message += (error_message.empty() ? std::string() : " and ") + "compiling some effects";
+			if (!_last_reload_successful)
+				error_message += _("There were errors loading some effects."),
+				error_message += ' ';
 #endif
 			if (!error_message.empty())
 			{
+				error_message += _("Check the log for more details.");
 				ImGui::Spacing();
-				ImGui::TextColored(COLOR_RED,
-					"There were errors %s. Check the log for more details.", error_message.c_str());
+				ImGui::TextColored(COLOR_RED, error_message.c_str());
 			}
 		}
 
@@ -892,7 +1246,51 @@ void reshade::runtime::draw_gui()
 		ImGui::PopStyleColor(2);
 		ImGui::PopStyleVar();
 	}
-	else if (show_stats_window)
+
+	if (show_message_window)
+	{
+		ImGui::SetNextWindowPos(_imgui_context->Style.WindowPadding + viewport_offset);
+		ImGui::SetNextWindowSize(ImVec2(imgui_io.DisplaySize.x - 20.0f, 0.0f));
+		ImGui::Begin("Message Window", nullptr,
+			ImGuiWindowFlags_NoDecoration |
+			ImGuiWindowFlags_NoNav |
+			ImGuiWindowFlags_NoMove |
+			ImGuiWindowFlags_NoInputs |
+			ImGuiWindowFlags_NoSavedSettings |
+			ImGuiWindowFlags_NoDocking |
+			ImGuiWindowFlags_NoFocusOnAppearing);
+
+		if (!_preset_save_successful)
+		{
+#if RESHADE_FX
+			ImGui::TextColored(COLOR_RED, _("Unable to save configuration and/or current preset. Make sure file permissions are set up to allow writing to these paths and their parent directories:\n%s\n%s"), _config_path.u8string().c_str(), _current_preset_path.u8string().c_str());
+#else
+			ImGui::TextColored(COLOR_RED, _("Unable to save configuration. Make sure file permissions are set up to allow writing to %s."), _config_path.u8string().c_str());
+#endif
+		}
+		else if (show_screenshot_message)
+		{
+			if (!_last_screenshot_save_successful)
+				if (_screenshot_directory_creation_successful)
+					ImGui::TextColored(COLOR_RED, _("Unable to save screenshot because of an internal error (the format may not be supported or the drive may be full)."));
+				else
+					ImGui::TextColored(COLOR_RED, _("Unable to save screenshot because path could not be created: %s"), (g_reshade_base_path / _screenshot_path).u8string().c_str());
+			else
+				ImGui::Text(_("Screenshot successfully saved to %s"), _last_screenshot_file.u8string().c_str());
+		}
+#if RESHADE_FX
+		else if (show_preset_transition_message)
+		{
+			ImGui::Text(_("Switching preset to %s ..."), _current_preset_path.stem().u8string().c_str());
+		}
+#endif
+
+		viewport_offset.y += ImGui::GetWindowHeight() + _imgui_context->Style.WindowPadding.x; // Add small space between windows
+
+		ImGui::End();
+	}
+
+	if (show_statistics_window && !show_splash_window && !show_message_window)
 	{
 		ImVec2 fps_window_pos(5, 5);
 		ImVec2 fps_window_size(200, 0);
@@ -902,7 +1300,7 @@ void reshade::runtime::draw_gui()
 		{
 			fps_window_size  = fps_window->Size;
 			fps_window_size.y = std::max(fps_window_size.y, _imgui_context->Style.FramePadding.y * 4.0f + _imgui_context->Style.ItemSpacing.y +
-				(_imgui_context->Style.ItemSpacing.y + _imgui_context->FontBaseSize * _fps_scale) * ((show_clock ? 1 : 0) + (show_fps ? 1 : 0) + (show_frametime ? 1 : 0)));
+				(_imgui_context->Style.ItemSpacing.y + _imgui_context->FontBaseSize * _fps_scale) * ((show_clock ? 1 : 0) + (show_fps ? 1 : 0) + (show_frametime ? 1 : 0) + (show_preset_name ? 1 : 0)));
 		}
 
 		if (_fps_pos % 2)
@@ -925,6 +1323,7 @@ void reshade::runtime::draw_gui()
 
 		ImGui::SetWindowFontScale(_fps_scale);
 
+		const float content_width = ImGui::GetContentRegionAvail().x;
 		char temp[512];
 
 		if (show_clock)
@@ -932,25 +1331,47 @@ void reshade::runtime::draw_gui()
 			const std::time_t t = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
 			struct tm tm; localtime_s(&tm, &t);
 
-			ImFormatString(temp, sizeof(temp), _clock_format != 0 ? "%02u:%02u:%02u" : "%02u:%02u", tm.tm_hour, tm.tm_min, tm.tm_sec);
+			int temp_size;
+			switch (_clock_format)
+			{
+			default:
+			case 0:
+				temp_size = ImFormatString(temp, sizeof(temp), "%02d:%02d", tm.tm_hour, tm.tm_min);
+				break;
+			case 1:
+				temp_size = ImFormatString(temp, sizeof(temp), "%02d:%02d:%02d", tm.tm_hour, tm.tm_min, tm.tm_sec);
+				break;
+			case 2:
+				temp_size = ImFormatString(temp, sizeof(temp), "%.4d-%.2d-%.2d %02d:%02d:%02d", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
+				break;
+			}
 			if (_fps_pos % 2) // Align text to the right of the window
-				ImGui::SetCursorPosX(ImGui::GetContentRegionAvail().x - ImGui::CalcTextSize(temp).x + _imgui_context->Style.ItemSpacing.x);
-			ImGui::TextUnformatted(temp);
+				ImGui::SetCursorPosX(content_width - ImGui::CalcTextSize(temp, temp + temp_size).x + _imgui_context->Style.ItemSpacing.x);
+			ImGui::TextUnformatted(temp, temp + temp_size);
 		}
 		if (show_fps)
 		{
-			ImFormatString(temp, sizeof(temp), "%.0f fps", imgui_io.Framerate);
+			const int temp_size = ImFormatString(temp, sizeof(temp), "%.0f fps", imgui_io.Framerate);
 			if (_fps_pos % 2)
-				ImGui::SetCursorPosX(ImGui::GetContentRegionAvail().x - ImGui::CalcTextSize(temp).x + _imgui_context->Style.ItemSpacing.x);
-			ImGui::TextUnformatted(temp);
+				ImGui::SetCursorPosX(content_width - ImGui::CalcTextSize(temp, temp + temp_size).x + _imgui_context->Style.ItemSpacing.x);
+			ImGui::TextUnformatted(temp, temp + temp_size);
 		}
 		if (show_frametime)
 		{
-			ImFormatString(temp, sizeof(temp), "%5.2f ms", 1000.0f / imgui_io.Framerate);
+			const int temp_size = ImFormatString(temp, sizeof(temp), "%5.2f ms", 1000.0f / imgui_io.Framerate);
 			if (_fps_pos % 2)
-				ImGui::SetCursorPosX(ImGui::GetContentRegionAvail().x - ImGui::CalcTextSize(temp).x + _imgui_context->Style.ItemSpacing.x);
-			ImGui::TextUnformatted(temp);
+				ImGui::SetCursorPosX(content_width - ImGui::CalcTextSize(temp, temp + temp_size).x + _imgui_context->Style.ItemSpacing.x);
+			ImGui::TextUnformatted(temp, temp + temp_size);
 		}
+#if RESHADE_FX
+		if (show_preset_name)
+		{
+			const std::string preset_name = _current_preset_path.stem().u8string();
+			if (_fps_pos % 2)
+				ImGui::SetCursorPosX(content_width - ImGui::CalcTextSize(preset_name.c_str(), preset_name.c_str() + preset_name.size()).x + _imgui_context->Style.ItemSpacing.x);
+			ImGui::TextUnformatted(preset_name.c_str(), preset_name.c_str() + preset_name.size());
+		}
+#endif
 
 		ImGui::Dummy(ImVec2(200, 0)); // Force a minimum window width
 
@@ -960,30 +1381,46 @@ void reshade::runtime::draw_gui()
 
 	if (_show_overlay)
 	{
+		const ImGuiViewport *const viewport = ImGui::GetMainViewport();
+
 		// Change font size if user presses the control key and moves the mouse wheel
-		if (imgui_io.KeyCtrl && imgui_io.MouseWheel != 0 && !_no_font_scaling)
+		if (!_no_font_scaling && imgui_io.KeyCtrl && imgui_io.MouseWheel != 0 && ImGui::IsWindowHovered(ImGuiHoveredFlags_AnyWindow))
 		{
-			_font_size = ImClamp(_font_size + static_cast<int>(imgui_io.MouseWheel), 8, 32);
-			_editor_font_size = ImClamp(_editor_font_size + static_cast<int>(imgui_io.MouseWheel), 8, 32);
-			_rebuild_font_atlas = true;
+			_font_size = ImClamp(_font_size + static_cast<int>(imgui_io.MouseWheel), 8, 64);
+			_editor_font_size = ImClamp(_editor_font_size + static_cast<int>(imgui_io.MouseWheel), 8, 64);
+			imgui_io.Fonts->TexReady = false;
 			save_config();
+
+			_is_font_scaling = true;
 		}
 
-		static constexpr std::pair<const char *, void(runtime::*)()> overlay_callbacks[] = {
+		if (_is_font_scaling)
+		{
+			if (!imgui_io.KeyCtrl)
+				_is_font_scaling = false;
+
+			ImGui::SetNextWindowPos(viewport->GetCenter(), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+			ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, _imgui_context->Style.WindowPadding * 2.0f);
+			ImGui::Begin("FontScaling", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings);
+			ImGui::Text(_("Scaling font size (%d) with 'Ctrl' + mouse wheel"), _font_size);
+			ImGui::End();
+			ImGui::PopStyleVar();
+		}
+
+		const std::pair<std::string, void(runtime::*)()> overlay_callbacks[] = {
 #if RESHADE_FX
-			{ "Home", &runtime::draw_gui_home },
+			{ _("Home###home"), &runtime::draw_gui_home },
 #endif
 #if RESHADE_ADDON
-			{ "Add-ons", &runtime::draw_gui_addons },
+			{ _("Add-ons###addons"), &runtime::draw_gui_addons },
 #endif
-			{ "Settings", &runtime::draw_gui_settings },
-			{ "Statistics", &runtime::draw_gui_statistics },
-			{ "Log", &runtime::draw_gui_log },
-			{ "About", &runtime::draw_gui_about }
+			{ _("Settings###settings"), &runtime::draw_gui_settings },
+			{ _("Statistics###statistics"), &runtime::draw_gui_statistics },
+			{ _("Log###log"), &runtime::draw_gui_log },
+			{ _("About###about"), &runtime::draw_gui_about }
 		};
 
-		const ImGuiID root_space_id = ImGui::GetID("Dockspace");
-		const ImGuiViewport *const viewport = ImGui::GetMainViewport();
+		const ImGuiID root_space_id = ImGui::GetID("ViewportDockspace");
 
 		// Set up default dock layout if this was not done yet
 		const bool init_window_layout = !ImGui::DockBuilderGetNode(root_space_id);
@@ -999,8 +1436,8 @@ void reshade::runtime::draw_gui()
 			ImGui::DockBuilderSplitNode(root_space_id, ImGuiDir_Left, 0.35f, &main_space_id, &right_space_id);
 
 			// Attach most windows to the main dock space
-			for (const std::pair<const char *, void(runtime::*)()> &widget : overlay_callbacks)
-				ImGui::DockBuilderDockWindow(widget.first, main_space_id);
+			for (const std::pair<std::string, void(runtime::*)()> &widget : overlay_callbacks)
+				ImGui::DockBuilderDockWindow(widget.first.c_str(), main_space_id);
 
 			// Attach editor window to the remaining dock space
 			ImGui::DockBuilderDockWindow("###editor", right_space_id);
@@ -1023,19 +1460,19 @@ void reshade::runtime::draw_gui()
 		ImGui::DockSpace(root_space_id, ImVec2(0, 0), ImGuiDockNodeFlags_PassthruCentralNode);
 		ImGui::End();
 
-		if (_imgui_context->NavInputSource != ImGuiInputSource_None)
+		if (_imgui_context->NavInputSource > ImGuiInputSource_Mouse && _imgui_context->NavWindowingTarget == nullptr)
 		{
 			// Reset input source to mouse when the cursor is moved
 			if (_input != nullptr && (_input->mouse_movement_delta_x() != 0 || _input->mouse_movement_delta_y() != 0))
-				_imgui_context->NavInputSource = ImGuiInputSource_None;
+				_imgui_context->NavInputSource = ImGuiInputSource_Mouse;
 			// Ensure there is always a window that has navigation focus when keyboard or gamepad navigation is used (choose the first overlay window created next)
 			else if (!ImGui::IsWindowFocused(ImGuiFocusedFlags_AnyWindow))
 				ImGui::SetNextWindowFocus();
 		}
 
-		for (const std::pair<const char *, void(runtime:: *)()> &widget : overlay_callbacks)
+		for (const std::pair<std::string, void(runtime:: *)()> &widget : overlay_callbacks)
 		{
-			if (ImGui::Begin(widget.first, nullptr, ImGuiWindowFlags_NoFocusOnAppearing)) // No focus so that window state is preserved between opening/closing the GUI
+			if (ImGui::Begin(widget.first.c_str(), nullptr, ImGuiWindowFlags_NoFocusOnAppearing)) // No focus so that window state is preserved between opening/closing the GUI
 				(this->*widget.second)();
 			ImGui::End();
 		}
@@ -1043,7 +1480,7 @@ void reshade::runtime::draw_gui()
 #if RESHADE_FX
 		if (!_editors.empty())
 		{
-			if (ImGui::Begin("Edit###editor", nullptr, ImGuiWindowFlags_NoFocusOnAppearing) &&
+			if (ImGui::Begin(_("Edit###editor"), nullptr, ImGuiWindowFlags_NoFocusOnAppearing) &&
 				ImGui::BeginTabBar("editor_tabs"))
 			{
 				for (auto it = _editors.begin(); it != _editors.end();)
@@ -1079,19 +1516,16 @@ void reshade::runtime::draw_gui()
 #endif
 	}
 
-#if RESHADE_ADDON
-	// Do not show add-on overlays while loading in case they are still referencing any variable or technique handles
-	if (!is_loading()
-#if RESHADE_ADDON_LITE
-		&& addon_enabled
+#if RESHADE_ADDON == 1
+	if (addon_enabled)
 #endif
-		)
+#if RESHADE_ADDON
 	{
 		for (const addon_info &info : addon_loaded_info)
 		{
 			for (const addon_info::overlay_callback &widget : info.overlay_callbacks)
 			{
-				if (widget.title == "OSD" ? show_splash || (!show_stats_window && !_show_overlay) : !_show_overlay)
+				if (widget.title == "OSD" ? show_splash_window : !_show_overlay)
 					continue;
 
 				if (ImGui::Begin(widget.title.c_str(), nullptr, ImGuiWindowFlags_NoFocusOnAppearing))
@@ -1099,9 +1533,9 @@ void reshade::runtime::draw_gui()
 				ImGui::End();
 			}
 		}
-	}
 
-	invoke_addon_event<addon_event::reshade_overlay>(this);
+		invoke_addon_event<addon_event::reshade_overlay>(this);
+	}
 #endif
 
 #if RESHADE_FX
@@ -1123,9 +1557,6 @@ void reshade::runtime::draw_gui()
 			ImGui::End();
 		}
 
-		// The preview texture is unset in 'destroy_effect', so should not be able to reach this while loading
-		assert(!is_loading() && _reload_create_queue.empty());
-
 		// Scale image to fill the entire viewport by default
 		ImVec2 preview_min = ImVec2(0, 0);
 		ImVec2 preview_max = imgui_io.DisplaySize;
@@ -1146,6 +1577,10 @@ void reshade::runtime::draw_gui()
 	}
 #endif
 
+#if RESHADE_LOCALIZATION
+	resources::set_current_language(prev_language);
+#endif
+
 	// Disable keyboard shortcuts while typing into input boxes
 	_ignore_shortcuts |= ImGui::IsAnyItemActive();
 
@@ -1154,8 +1589,10 @@ void reshade::runtime::draw_gui()
 
 	if (_input != nullptr)
 	{
-		_input->block_mouse_input(_input_processing_mode != 0 && _show_overlay && (imgui_io.WantCaptureMouse || _input_processing_mode == 2));
-		_input->block_keyboard_input(_input_processing_mode != 0 && _show_overlay && (imgui_io.WantCaptureKeyboard || _input_processing_mode == 2));
+		const bool block_input = _input_processing_mode != 0 && (_show_overlay || _block_input_next_frame);
+
+		_input->block_mouse_input(block_input && (imgui_io.WantCaptureMouse || _input_processing_mode == 2));
+		_input->block_keyboard_input(block_input && (imgui_io.WantCaptureKeyboard || _input_processing_mode == 2));
 	}
 
 	if (ImDrawData *const draw_data = ImGui::GetDrawData();
@@ -1169,11 +1606,11 @@ void reshade::runtime::draw_gui()
 		}
 		else
 		{
-			uint32_t back_buffer_index = get_current_back_buffer_index();
-			const api::resource back_buffer_resource = get_back_buffer(back_buffer_index);
+			uint32_t back_buffer_index = get_current_back_buffer_index() * 2;
+			const api::resource back_buffer_resource = _device->get_resource_from_view(_back_buffer_targets[back_buffer_index]);
 
 			cmd_list->barrier(back_buffer_resource, api::resource_usage::present, api::resource_usage::render_target);
-			render_imgui_draw_data(cmd_list, draw_data, _back_buffer_targets[back_buffer_index * 2]);
+			render_imgui_draw_data(cmd_list, draw_data, _back_buffer_targets[back_buffer_index]);
 			cmd_list->barrier(back_buffer_resource, api::resource_usage::render_target, api::resource_usage::present);
 		}
 	}
@@ -1184,34 +1621,30 @@ void reshade::runtime::draw_gui()
 #if RESHADE_FX
 void reshade::runtime::draw_gui_home()
 {
-	const char *tutorial_text =
-		"Welcome! Since this is the first time you start ReShade, we'll go through a quick tutorial covering the most important features.\n\n"
-		"If you have difficulties reading this text, press the 'Ctrl' key and adjust the font size with your mouse wheel. "
-		"The window size is variable as well, just grab the right edge and move it around.\n\n"
-		"You can also use the keyboard for navigation in case mouse input does not work. Use the arrow keys to navigate, space bar to confirm an action or enter a control and the 'Esc' key to leave a control. "
-		"Press 'Ctrl + Tab' to switch between tabs and windows (use this to focus this page in case the other navigation keys do not work at first).\n\n"
-		"Click on the 'Continue' button to continue the tutorial.";
+	std::string tutorial_text;
 
 	// It is not possible to follow some of the tutorial steps while performance mode is active, so skip them
 	if (_performance_mode && _tutorial_index <= 3)
 		_tutorial_index = 4;
 
+	const float auto_save_button_spacing = 2.0f;
+	const float button_width = 12.5f * _font_size;
+
 	if (_tutorial_index > 0)
 	{
 		if (_tutorial_index == 1)
 		{
-			tutorial_text =
+			tutorial_text = _(
 				"This is the preset selection. All changes will be saved to the selected preset file.\n\n"
-				"Click on the '+' button to name and add a new one.\n\n"
-				"Make sure you always have a preset selected here before starting to tweak any values later, or else your changes won't be saved!";
+				"Click on the '+' button to add a new one.\n"
+				"Use the right mouse button and click on the preset button to open a context menu with additional options.");
 
 			ImGui::PushStyleColor(ImGuiCol_FrameBg, COLOR_RED);
 			ImGui::PushStyleColor(ImGuiCol_Button, COLOR_RED);
 		}
 
-		const float button_size = ImGui::GetFrameHeight();
+		const float button_height = ImGui::GetFrameHeight();
 		const float button_spacing = _imgui_context->Style.ItemInnerSpacing.x;
-		const float browse_button_width = ImGui::GetContentRegionAvail().x - (button_spacing + button_size) * (_performance_mode ? 3 : (_save_present_on_modification ? 4 : 5));
 
 		bool reload_preset = false;
 
@@ -1223,23 +1656,34 @@ void reshade::runtime::draw_gui_home()
 			ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
 		}
 
-		if (ImGui::ArrowButtonEx("<", ImGuiDir_Left, ImVec2(button_size, button_size), ImGuiButtonFlags_NoNavFocus))
+		if (ImGui::ArrowButtonEx("<", ImGuiDir_Left, ImVec2(button_height, button_height), ImGuiButtonFlags_NoNavFocus))
 			if (switch_to_next_preset(_current_preset_path.parent_path(), true))
 				reload_preset = true;
+		ImGui::SetItemTooltip(_("Previous preset"));
+
 		ImGui::SameLine(0, button_spacing);
-		if (ImGui::ArrowButtonEx(">", ImGuiDir_Right, ImVec2(button_size, button_size), ImGuiButtonFlags_NoNavFocus))
+
+		if (ImGui::ArrowButtonEx(">", ImGuiDir_Right, ImVec2(button_height, button_height), ImGuiButtonFlags_NoNavFocus))
 			if (switch_to_next_preset(_current_preset_path.parent_path(), false))
 				reload_preset = true;
+		ImGui::SetItemTooltip(_("Next preset"));
 
-		ImGui::SameLine(0, button_spacing);
-		const ImVec2 popup_pos = ImGui::GetCursorScreenPos() + ImVec2(-_imgui_context->Style.WindowPadding.x, ImGui::GetFrameHeightWithSpacing());
+		ImGui::SameLine();
 
 		ImGui::PushStyleVar(ImGuiStyleVar_ButtonTextAlign, ImVec2(0.0f, 0.5f));
-		if (ImGui::ButtonEx(_current_preset_path.stem().u8string().c_str(), ImVec2(browse_button_width, 0), ImGuiButtonFlags_NoNavFocus))
+
+		const auto browse_button_pos = ImGui::GetCursorScreenPos();
+		const auto browse_button_width = ImGui::GetContentRegionAvail().x - (button_height + button_spacing + _imgui_context->Style.ItemSpacing.x + auto_save_button_spacing + button_width);
+
+		if (ImGui::ButtonEx((_current_preset_path.stem().u8string() + "###browse_button").c_str(), ImVec2(browse_button_width, 0), ImGuiButtonFlags_NoNavFocus))
 		{
 			_file_selection_path = _current_preset_path;
 			ImGui::OpenPopup("##browse");
 		}
+
+		if (_preset_is_modified)
+			ImGui::RenderBullet(ImGui::GetWindowDrawList(), browse_button_pos + ImVec2(browse_button_width - _font_size * 0.5f - _imgui_context->Style.FramePadding.x, button_height * 0.5f), ImGui::GetColorU32(ImGuiCol_Text));
+
 		ImGui::PopStyleVar();
 
 		if (_input != nullptr &&
@@ -1254,7 +1698,7 @@ void reshade::runtime::draw_gui_home()
 			else
 				shortcut.preset_path = _current_preset_path;
 
-			ImGui::SetNextItemWidth(230.0f);
+			ImGui::SetNextItemWidth(18.0f * _font_size);
 			if (imgui::key_input_box("##toggle_key", shortcut.key_data, *_input))
 			{
 				if (preset_shortcut_it != _preset_shortcuts.end())
@@ -1266,46 +1710,80 @@ void reshade::runtime::draw_gui_home()
 			ImGui::EndPopup();
 		}
 
-		// Cannot save in performance mode, since there are no variables to retrieve values from then
-		if (!_performance_mode)
+		ImGui::SameLine(0, button_spacing);
+
+		if (ImGui::Button(ICON_FK_FOLDER, ImVec2(button_height, button_height)))
+			utils::open_explorer(_current_preset_path);
+		ImGui::SetItemTooltip(_("Open folder in explorer"));
+
+		ImGui::SameLine();
+
+		const bool was_auto_save_preset = _auto_save_preset;
+
+		if (imgui::toggle_button(
+				(std::string(was_auto_save_preset ? _("Auto Save on") : _("Auto Save")) + "###auto_save").c_str(),
+				_auto_save_preset,
+				(was_auto_save_preset ? 0.0f : auto_save_button_spacing) + button_width - (button_spacing + button_height) * (was_auto_save_preset ? 2 : 3)))
 		{
-			ImGui::BeginDisabled(_is_in_between_presets_transition);
-
-			if (!_save_present_on_modification)
-			{
-				ImGui::SameLine(0, button_spacing);
-
-				if (ImGui::ButtonEx(ICON_FK_UNDO, ImVec2(button_size, 0), ImGuiButtonFlags_NoNavFocus))
-					load_current_preset();
-
-				if (ImGui::IsItemHovered())
-					ImGui::SetTooltip("Reset all values to those of the current preset before it was modified");
-			}
-
-			ImGui::SameLine(0, button_spacing);
-
-			if (ImGui::ButtonEx(ICON_FK_FLOPPY, ImVec2(button_size, 0), ImGuiButtonFlags_NoNavFocus))
-			{
-				ini_file::load_cache(_current_preset_path).clear();
+			if (!was_auto_save_preset)
 				save_current_preset();
-				ini_file::flush_cache(_current_preset_path);
-			}
+			save_config();
 
-			if (ImGui::IsItemHovered())
-				ImGui::SetTooltip("Clean up and save the current preset (removes all settings for disabled techniques)");
-
-			ImGui::EndDisabled();
+			_preset_is_modified = false;
 		}
 
-		ImGui::SameLine(0, button_spacing);
-		if (ImGui::ButtonEx(ICON_FK_PLUS, ImVec2(button_size, 0), ImGuiButtonFlags_NoNavFocus | ImGuiButtonFlags_PressedOnClick))
+		ImGui::SetItemTooltip(_("Save current preset automatically on every modification."));
+
+		if (was_auto_save_preset)
 		{
+			ImGui::SameLine(0, button_spacing + auto_save_button_spacing);
+		}
+		else
+		{
+			ImGui::SameLine(0, button_spacing);
+
+			ImGui::BeginDisabled(!_preset_is_modified);
+
+			if (imgui::confirm_button(ICON_FK_UNDO, button_height, _("Do you really want to reset all techniques and values?")))
+				reload_preset = true;
+
+			ImGui::SetItemTooltip(_("Reset all techniques and values to those of the current preset."));
+
+			ImGui::EndDisabled();
+
+			ImGui::SameLine(0, button_spacing);
+		}
+
+		// Cannot save in performance mode, since there are no variables to retrieve values from then
+		ImGui::BeginDisabled(_performance_mode || _is_in_preset_transition);
+
+		const auto save_and_clean_preset = _auto_save_preset || (_imgui_context->IO.KeyCtrl || _imgui_context->IO.KeyShift);
+
+		if (ImGui::ButtonEx(ICON_FK_FLOPPY, ImVec2(button_height, button_height), ImGuiButtonFlags_NoNavFocus))
+		{
+			if (save_and_clean_preset)
+				ini_file::load_cache(_current_preset_path).clear();
+			save_current_preset();
+			ini_file::flush_cache(_current_preset_path);
+
+			_preset_is_modified = false;
+		}
+
+		ImGui::SetItemTooltip(save_and_clean_preset ?
+			_("Clean up and save the current preset (removes all values for disabled techniques).") : _("Save the current preset."));
+
+		ImGui::EndDisabled();
+
+		ImGui::SameLine(0, button_spacing);
+		if (ImGui::ButtonEx(ICON_FK_PLUS, ImVec2(button_height, button_height), ImGuiButtonFlags_NoNavFocus | ImGuiButtonFlags_PressedOnClick))
+		{
+			_inherit_current_preset = false;
+			_template_preset_path.clear();
 			_file_selection_path = _current_preset_path.parent_path();
 			ImGui::OpenPopup("##create");
 		}
 
-		if (ImGui::IsItemHovered())
-			ImGui::SetTooltip("Add a new preset");
+		ImGui::SetItemTooltip(_("Add a new preset."));
 
 		if (was_loading)
 		{
@@ -1313,8 +1791,8 @@ void reshade::runtime::draw_gui_home()
 			ImGui::PopItemFlag();
 		}
 
-		ImGui::SetNextWindowPos(popup_pos);
-		if (imgui::file_dialog("##browse", _file_selection_path, browse_button_width, { L".ini", L".txt" }, { _config_path, global_config().path() }))
+		ImGui::SetNextWindowPos(browse_button_pos + ImVec2(-_imgui_context->Style.WindowPadding.x, ImGui::GetFrameHeightWithSpacing()));
+		if (imgui::file_dialog("##browse", _file_selection_path, std::max(browse_button_width, 450.0f), { L".ini", L".txt" }, { _config_path, global_config().path() }))
 		{
 			// Check that this is actually a valid preset file
 			if (ini_file::load_cache(_file_selection_path).has({}, "Techniques"))
@@ -1331,12 +1809,18 @@ void reshade::runtime::draw_gui_home()
 
 		if (ImGui::BeginPopup("##create"))
 		{
-			ImGui::Checkbox("Duplicate current preset", &_duplicate_current_preset);
+			ImGui::Checkbox(_("Inherit current preset"), &_inherit_current_preset);
+
+			if (!_inherit_current_preset)
+				imgui::file_input_box(_("Template"), nullptr, _template_preset_path, _file_selection_path, { L".ini", L".txt" });
+
+			if (ImGui::IsWindowAppearing())
+				ImGui::SetKeyboardFocusHere();
 
 			char preset_name[260] = "";
-			if (ImGui::InputText("Name", preset_name, sizeof(preset_name), ImGuiInputTextFlags_EnterReturnsTrue) && preset_name[0] != '\0')
+			if (ImGui::InputText(_("Preset name"), preset_name, sizeof(preset_name), ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_CallbackCharFilter, filter_name) && preset_name[0] != '\0')
 			{
-				std::filesystem::path new_preset_path = _file_selection_path / std::filesystem::u8path(preset_name);
+				std::filesystem::path new_preset_path = _current_preset_path.parent_path() / std::filesystem::u8path(preset_name);
 				if (new_preset_path.extension() != L".ini" && new_preset_path.extension() != L".txt")
 					new_preset_path += L".ini";
 
@@ -1348,9 +1832,18 @@ void reshade::runtime::draw_gui_home()
 						file_type == std::filesystem::file_type::not_found ||
 						ini_file::load_cache(new_preset_path).has({}, "Techniques");
 
-					if (_duplicate_current_preset && file_type == std::filesystem::file_type::not_found)
-						if (!std::filesystem::copy_file(_current_preset_path, new_preset_path, std::filesystem::copy_options::overwrite_existing, ec))
-							LOG(ERROR) << "Failed to duplicate preset " << _current_preset_path << " to " << new_preset_path << " with error code " << ec.value() << '!';
+					if (file_type == std::filesystem::file_type::not_found)
+					{
+						if (_inherit_current_preset)
+						{
+							_current_preset_path = new_preset_path;
+							save_current_preset();
+						}
+						else if (!_template_preset_path.empty() && !std::filesystem::copy_file(_template_preset_path, new_preset_path, std::filesystem::copy_options::overwrite_existing, ec))
+						{
+							log::message(log::level::error, "Failed to copy preset template '%s' to '%s' with error code %d!", _template_preset_path.u8string().c_str(), new_preset_path.u8string().c_str(), ec.value());
+						}
+					}
 				}
 
 				if (reload_preset)
@@ -1360,35 +1853,47 @@ void reshade::runtime::draw_gui_home()
 				}
 				else
 				{
-					ImGui::SetKeyboardFocusHere();
+					ImGui::SetKeyboardFocusHere(-1);
 				}
 			}
-
-			if (ImGui::IsWindowAppearing())
-				ImGui::SetKeyboardFocusHere();
-
-			if (preset_name[0] == '\0' && ImGui::IsKeyPressedMap(ImGuiKey_Backspace))
-				ImGui::CloseCurrentPopup();
 
 			ImGui::EndPopup();
 		}
 
 		if (ImGui::BeginPopup("##preseterror"))
 		{
-			ImGui::TextColored(COLOR_RED, "The selected file is not a valid preset!");
+			ImGui::TextColored(COLOR_RED, _("The selected file is not a valid preset!"));
 			ImGui::EndPopup();
 		}
 
 		if (reload_preset)
 		{
-			_show_splash = true;
-
 			save_config();
 			load_current_preset();
+
+			_show_splash = true;
+			_preset_is_modified = false;
+			_last_preset_switching_time = _last_present_time;
+			_is_in_preset_transition = true;
+
+#if RESHADE_ADDON
+			if (!is_loading()) // Will be called by 'update_effects' when 'load_current_preset' forced a reload
+				invoke_addon_event<addon_event::reshade_set_current_preset_path>(this, _current_preset_path.u8string().c_str());
+#endif
 		}
 
 		if (_tutorial_index == 1)
 			ImGui::PopStyleColor(2);
+	}
+	else
+	{
+		tutorial_text = _(
+			"Welcome! Since this is the first time you start ReShade, we'll go through a quick tutorial covering the most important features.\n\n"
+			"If you have difficulties reading this text, press the 'Ctrl' key and adjust the font size with your mouse wheel. "
+			"The window size is variable as well, just grab the right edge and move it around.\n\n"
+			"You can also use the keyboard for navigation in case mouse input does not work. Use the arrow keys to navigate, space bar to confirm an action or enter a control and the 'Esc' key to leave a control. "
+			"Press 'Ctrl + Tab' to switch between tabs and windows (use this to focus this page in case the other navigation keys do not work at first).\n\n"
+			"Click on the 'Continue' button to continue the tutorial.");
 	}
 
 	if (_tutorial_index > 1)
@@ -1398,20 +1903,16 @@ void reshade::runtime::draw_gui_home()
 		ImGui::Spacing();
 	}
 
-	if (is_loading())
+	if (_reload_remaining_effects != std::numeric_limits<size_t>::max())
 	{
-		const char *const loading_message = ICON_FK_REFRESH " Loading ... ";
-		ImGui::SetCursorPos((ImGui::GetWindowSize() - ImGui::CalcTextSize(loading_message)) * 0.5f);
-		ImGui::TextUnformatted(loading_message);
+		ImGui::SetCursorPos(ImGui::GetWindowSize() * 0.5f - ImVec2(21, 21));
+		imgui::spinner((_effects.size() - _reload_remaining_effects) / float(_effects.size()), 16.0f * _font_size / 13, 10.0f * _font_size / 13);
 		return; // Cannot show techniques and variables while effects are loading, since they are being modified in other threads during that time
 	}
 
-	if (!_effects_enabled)
-		ImGui::Text("Effects are disabled. Press '%s' to enable them again.", input::key_name(_effects_key_data).c_str());
-
 	if (_tutorial_index > 1)
 	{
-		if (imgui::search_input_box(_effect_filter, sizeof(_effect_filter), -((_variable_editor_tabs ? 10.0f : 20.0f) * _font_size + (_variable_editor_tabs ? 1.0f : 2.0f) * _imgui_context->Style.ItemSpacing.x)))
+		if (imgui::search_input_box(_effect_filter, sizeof(_effect_filter), -((_variable_editor_tabs ? 1 : 2) * (_imgui_context->Style.ItemSpacing.x + 2.0f + button_width))))
 		{
 			_effects_expanded_state = 3;
 
@@ -1427,59 +1928,91 @@ void reshade::runtime::draw_gui_home()
 
 		ImGui::SameLine();
 
-		if (ImGui::Button("Active to top", ImVec2(10.0f * _font_size, 0)))
+		ImGui::BeginDisabled(_is_in_preset_transition);
+
+		if (ImGui::Button(_("Active to top"), ImVec2(auto_save_button_spacing + button_width, 0)))
 		{
-			for (auto it = _techniques.begin(), target_it = it; it != _techniques.end(); ++it)
+			std::vector<size_t> technique_indices = _technique_sorting;
+
+			for (auto it = technique_indices.begin(), target_it = it; it != technique_indices.end(); ++it)
 			{
-				if (it->enabled || it->toggle_key_data[0] != 0)
+				const technique &tech = _techniques[*it];
+
+				if (tech.enabled || tech.toggle_key_data[0] != 0)
 				{
 					target_it = std::rotate(target_it, it, std::next(it));
 				}
 			}
 
-			if (_save_present_on_modification)
+			reorder_techniques(std::move(technique_indices));
+
+			if (_auto_save_preset)
 				save_current_preset();
+			else
+				_preset_is_modified = true;
 		}
+
+		ImGui::EndDisabled();
 
 		if (!_variable_editor_tabs)
 		{
 			ImGui::SameLine();
 
-			if (ImGui::Button((_effects_expanded_state & 2) ? "Collapse all" : "Expand all", ImVec2(10.0f * _font_size, 0)))
+			if (ImGui::Button((_effects_expanded_state & 2) ? _("Collapse all") : _("Expand all"), ImVec2(auto_save_button_spacing + button_width, 0)))
 				_effects_expanded_state = (~_effects_expanded_state & 2) | 1;
 		}
 
 		if (_tutorial_index == 2)
 		{
-			tutorial_text =
-				"This is the list of effects. It contains all techniques exposed by effect files (*.fx) found in the effect search paths specified in the settings.\n\n"
+			tutorial_text = _(
+				"This is the list of effects. It contains all techniques exposed by effect files (.fx) found in the effect search paths specified in the settings.\n\n"
 				"Enter text in the \"Search\" box at the top to filter it and search for specific techniques.\n\n"
-				"Click on a technique to enable or disable it or drag it to a new location in the list to change the order in which the effects are applied.\n"
-				"Use the right mouse button and click on an item to open the context menu with additional options.\n\n";
+				"Click on a technique to enable or disable it or drag it to a new location in the list to change the order in which the effects are applied (from top to bottom).\n"
+				"Use the right mouse button and click on an item to open a context menu with additional options.");
 
 			ImGui::PushStyleColor(ImGuiCol_Border, COLOR_RED);
 		}
 
 		ImGui::Spacing();
 
-		const float bottom_height = ImGui::GetFrameHeightWithSpacing() + _imgui_context->Style.ItemSpacing.y + (
-			_performance_mode ? 0 : (17 /* splitter */ + (_variable_editor_height + (_tutorial_index == 3 ? 175 : 0))));
+		if (!_last_reload_successful)
+		{
+			ImGui::PushTextWrapPos();
+			ImGui::PushStyleColor(ImGuiCol_Text, COLOR_RED);
+			ImGui::TextUnformatted(_("There were errors loading some effects."));
+			ImGui::TextUnformatted(_("Hover the cursor over any red entries below to see the related error messages and/or check the log for more details if there are none."));
+			ImGui::PopStyleColor();
+			ImGui::PopTextWrapPos();
+			ImGui::Spacing();
+		}
 
-		if (ImGui::BeginChild("##techniques", ImVec2(0, -bottom_height), true))
+		if (!_effects_enabled)
+		{
+			ImGui::Text(_("Effects are disabled. Press '%s' to enable them again."), input::key_name(_effects_key_data).c_str());
+			ImGui::Spacing();
+		}
+
+		float bottom_height = _variable_editor_height;
+		bottom_height = std::max(bottom_height, 20.0f);
+		bottom_height = ImGui::GetFrameHeightWithSpacing() + _imgui_context->Style.ItemSpacing.y + (
+			_performance_mode ? 0 : (17 /* splitter */ + (bottom_height + (_tutorial_index == 3 ? 175 : 0))));
+		bottom_height = std::min(bottom_height, ImGui::GetContentRegionAvail().y - 20.0f);
+
+		if (ImGui::BeginChild("##techniques", ImVec2(0, -bottom_height), ImGuiChildFlags_Border))
 		{
 			if (_effect_load_skipping && _show_force_load_effects_button)
 			{
-				const size_t skipped_effects = std::count_if(_effects.begin(), _effects.end(),
+				const size_t skipped_effects = std::count_if(_effects.cbegin(), _effects.cend(),
 					[](const effect &effect) { return effect.skipped; });
 
 				if (skipped_effects > 0)
 				{
-					char buf[60];
-					ImFormatString(buf, sizeof(buf), "Force load all effects (%zu remaining)", skipped_effects);
-					if (ImGui::ButtonEx(buf, ImVec2(ImGui::GetContentRegionAvail().x, 0)))
+					char temp[64];
+					const int temp_size = ImFormatString(temp, sizeof(temp), _("Force load all effects (%zu remaining)"), skipped_effects);
+
+					if (ImGui::ButtonEx((std::string(temp, temp_size) + "###force_reload_button").c_str(), ImVec2(ImGui::GetContentRegionAvail().x, 0)))
 					{
-						_load_option_disable_skipping = true;
-						reload_effects();
+						reload_effects(true);
 
 						ImGui::EndChild();
 						return;
@@ -1487,7 +2020,9 @@ void reshade::runtime::draw_gui_home()
 				}
 			}
 
+			ImGui::BeginDisabled(_is_in_preset_transition);
 			draw_technique_editor();
+			ImGui::EndDisabled();
 		}
 		ImGui::EndChild();
 
@@ -1506,7 +2041,7 @@ void reshade::runtime::draw_gui_home()
 		if (ImGui::IsItemActive())
 		{
 			ImVec2 move_delta = _imgui_context->IO.MouseDelta;
-			move_delta += ImGui::GetNavInputAmount2d(ImGuiNavDirSourceFlags_RawKeyboard | ImGuiNavDirSourceFlags_PadLStick, ImGuiInputReadMode_Down) * _imgui_context->IO.DeltaTime * 500.0f;
+			move_delta += ImGui::GetKeyMagnitude2d(ImGuiKey_GamepadLStickLeft, ImGuiKey_GamepadLStickRight, ImGuiKey_GamepadLStickUp, ImGuiKey_GamepadLStickDown) * _imgui_context->IO.DeltaTime * 500.0f;
 
 			_variable_editor_height = std::max(_variable_editor_height - move_delta.y, 0.0f);
 			save_config();
@@ -1514,21 +2049,24 @@ void reshade::runtime::draw_gui_home()
 
 		if (_tutorial_index == 3)
 		{
-			tutorial_text =
+			tutorial_text = _(
 				"This is the list of variables. It contains all tweakable options the active effects expose. Values here apply in real-time.\n\n"
-				"Enter text in the box at the top to filter it and search for specific variables.\n\n"
 				"Press 'Ctrl' and click on a widget to manually edit the value (can also hold 'Ctrl' while adjusting the value in a widget to have it ignore any minimum or maximum values).\n"
-				"Use the right mouse button and click on an item to open the context menu with additional options.\n\n"
+				"Use the right mouse button and click on an item to open a context menu with additional options.\n\n"
 				"Once you have finished tweaking your preset, be sure to enable the 'Performance Mode' check box. "
-				"This will recompile all effects into a more optimal representation that can give a performance boost, but will disable variable tweaking and this list.";
+				"This will reload all effects into a more optimal representation that can give a performance boost, but disables variable tweaking and this list.");
 
 			ImGui::PushStyleColor(ImGuiCol_Border, COLOR_RED);
 		}
 
 		const float bottom_height = ImGui::GetFrameHeightWithSpacing() + _imgui_context->Style.ItemSpacing.y + (_tutorial_index == 3 ? 175 : 0);
 
-		if (ImGui::BeginChild("##variables", ImVec2(0, -bottom_height), true))
+		if (ImGui::BeginChild("##variables", ImVec2(0, -bottom_height), ImGuiChildFlags_Border))
+		{
+			ImGui::BeginDisabled(_is_in_preset_transition);
 			draw_variable_editor();
+			ImGui::EndDisabled();
+		}
 		ImGui::EndChild();
 
 		if (_tutorial_index == 3)
@@ -1539,7 +2077,7 @@ void reshade::runtime::draw_gui_home()
 	{
 		ImGui::Spacing();
 
-		if (ImGui::Button(ICON_FK_REFRESH " Reload", ImVec2(-11.5f * _font_size, 0)))
+		if (ImGui::Button((ICON_FK_REFRESH " " + std::string(_("Reload"))).c_str(), ImVec2(-(auto_save_button_spacing + button_width), 0)))
 		{
 			load_config(); // Reload configuration too
 
@@ -1549,25 +2087,37 @@ void reshade::runtime::draw_gui_home()
 			reload_effects();
 		}
 
+		ImGui::SetItemTooltip(_("Reload all effects (can hold 'Ctrl' while clicking to clear the effect cache before loading)."));
+
 		ImGui::SameLine();
 
-		if (ImGui::Checkbox("Performance Mode", &_performance_mode))
+		if (ImGui::Checkbox(_("Performance Mode"), &_performance_mode))
 		{
 			save_config();
 			reload_effects(); // Reload effects after switching
 		}
+
+		ImGui::SetItemTooltip(_("Reload all effects into a more optimal representation that can give a performance boost, but disables variable tweaking."));
 	}
 	else
 	{
-		ImGui::BeginChildFrame(ImGui::GetID("tutorial"), ImVec2(0, 175));
-		ImGui::TextWrapped(tutorial_text);
-		ImGui::EndChildFrame();
+		const float max_frame_width = ImGui::GetContentRegionAvail().x;
+		const float max_frame_height = ImGui::GetContentRegionAvail().y - ImGui::GetFrameHeight() - _imgui_context->Style.ItemSpacing.y;
+		const float required_frame_height =
+			ImGui::CalcTextSize(tutorial_text.data(), tutorial_text.data() + tutorial_text.size(), false, max_frame_width - _imgui_context->Style.FramePadding.x * 2).y +
+			_imgui_context->Style.FramePadding.y * 2;
 
-		const float max_button_width = ImGui::GetContentRegionAvail().x;
+		if (ImGui::BeginChild("##tutorial", ImVec2(max_frame_width, std::min(max_frame_height, required_frame_height)), ImGuiChildFlags_FrameStyle))
+		{
+			ImGui::PushTextWrapPos();
+			ImGui::TextUnformatted(tutorial_text.data(), tutorial_text.data() + tutorial_text.size());
+			ImGui::PopTextWrapPos();
+		}
+		ImGui::EndChild();
 
 		if (_tutorial_index == 0)
 		{
-			if (ImGui::Button("Continue", ImVec2(max_button_width * 0.66666666f, 0)))
+			if (ImGui::Button((std::string(_("Continue")) + "###tutorial_button").c_str(), ImVec2(max_frame_width * 0.66666666f, 0)))
 			{
 				_tutorial_index++;
 
@@ -1576,27 +2126,21 @@ void reshade::runtime::draw_gui_home()
 
 			ImGui::SameLine();
 
-			if (ImGui::Button("Skip Tutorial", ImVec2(max_button_width * 0.33333333f - _imgui_context->Style.ItemSpacing.x, 0)))
+			if (ImGui::Button(_("Skip Tutorial"), ImVec2(max_frame_width * 0.33333333f - _imgui_context->Style.ItemSpacing.x, 0)))
 			{
 				_tutorial_index = 4;
-				_no_font_scaling = true;
 
 				save_config();
 			}
 		}
 		else
 		{
-			if (ImGui::Button(_tutorial_index == 3 ? "Finish" : "Continue", ImVec2(max_button_width, 0)))
+			if (ImGui::Button((std::string(_tutorial_index == 3 ? _("Finish") : _("Continue")) + "###tutorial_button").c_str(), ImVec2(max_frame_width, 0)))
 			{
 				_tutorial_index++;
 
 				if (_tutorial_index == 4)
-				{
-					// Disable font scaling after tutorial
-					_no_font_scaling = true;
-
 					save_config();
-				}
 			}
 		}
 	}
@@ -1604,88 +2148,95 @@ void reshade::runtime::draw_gui_home()
 #endif
 void reshade::runtime::draw_gui_settings()
 {
+	if (ImGui::Button((ICON_FK_FOLDER " " + std::string(_("Open base folder in explorer"))).c_str(), ImVec2(-1, 0)))
+		utils::open_explorer(_config_path);
+
+	ImGui::Spacing();
+
 	bool modified = false;
 	bool modified_custom_style = false;
 
-	if (ImGui::CollapsingHeader("General", ImGuiTreeNodeFlags_DefaultOpen))
+	if (ImGui::CollapsingHeader(_("General"), ImGuiTreeNodeFlags_DefaultOpen))
 	{
 		if (_input != nullptr)
 		{
-			modified |= imgui::key_input_box("Overlay key", _overlay_key_data, *_input);
+			std::string input_processing_mode_items = _(
+				"Pass on all input\n"
+				"Block input when cursor is on overlay\n"
+				"Block all input when overlay is visible\n");
+			std::replace(input_processing_mode_items.begin(), input_processing_mode_items.end(), '\n', '\0');
+			modified |= ImGui::Combo(_("Input processing"), reinterpret_cast<int *>(&_input_processing_mode), input_processing_mode_items.c_str());
+
+			modified |= imgui::key_input_box(_("Overlay key"), _overlay_key_data, *_input);
 			modified |= imgui::key_input_box("NFSMW HUD toggle key", _toggle_fe_key_data, *_input);
 
 #if RESHADE_FX
-			modified |= imgui::key_input_box("Effect toggle key", _effects_key_data, *_input);
-			modified |= imgui::key_input_box("Effect reload key", _reload_key_data, *_input);
+			modified |= imgui::key_input_box(_("Effect toggle key"), _effects_key_data, *_input);
+			modified |= imgui::key_input_box(_("Effect reload key"), _reload_key_data, *_input);
 
-			modified |= imgui::key_input_box("Performance mode toggle key", _performance_mode_key_data, *_input);
+			modified |= imgui::key_input_box(_("Performance mode toggle key"), _performance_mode_key_data, *_input);
 
-			modified |= imgui::key_input_box("Previous preset key", _prev_preset_key_data, *_input);
-			modified |= imgui::key_input_box("Next preset key", _next_preset_key_data, *_input);
+			modified |= imgui::key_input_box(_("Previous preset key"), _prev_preset_key_data, *_input);
+			modified |= imgui::key_input_box(_("Next preset key"), _next_preset_key_data, *_input);
 
-			modified |= ImGui::SliderInt("Preset transition duration", reinterpret_cast<int *>(&_preset_transition_duration), 0, 10 * 1000);
-			if (ImGui::IsItemHovered())
-				ImGui::SetTooltip("Makes a smooth transition, but only for floating point values.\nRecommended for multiple presets that contain the same effects, otherwise set this to zero.\nValues are in milliseconds.");
+			modified |= ImGui::SliderInt(_("Preset transition duration"), reinterpret_cast<int *>(&_preset_transition_duration), 0, 10 * 1000);
+			ImGui::SetItemTooltip(_(
+				"Make a smooth transition when switching presets, but only for floating point values.\n"
+				"Recommended for multiple presets that contain the same effects, otherwise set this to zero.\n"
+				"Values are in milliseconds."));
 #endif
 
-			modified |= ImGui::Combo("Input processing", reinterpret_cast<int *>(&_input_processing_mode),
-				"Pass on all input\0"
-				"Block input when cursor is on overlay\0"
-				"Block all input when overlay is visible\0");
-#if RESHADE_FX
 			ImGui::Spacing();
-#endif
 		}
 
 #if RESHADE_FX
-		modified |= imgui::path_list("Effect search paths", _effect_search_paths, _file_selection_path, g_reshade_base_path);
-		if (ImGui::IsItemHovered())
-			ImGui::SetTooltip("List of directory paths to be searched for effect files (*.fx).\nPaths that end in \"\\**\" are searched recursively.");
-		modified |= imgui::path_list("Texture search paths", _texture_search_paths, _file_selection_path, g_reshade_base_path);
-		if (ImGui::IsItemHovered())
-			ImGui::SetTooltip("List of directory paths to be searched for texture image files.\nPaths that end in \"\\**\" are searched recursively.");
+		modified |= imgui::file_input_box(_("Start-up preset"), nullptr, _startup_preset_path, _file_selection_path, { L".ini", L".txt" });
+		ImGui::SetItemTooltip(_("When not empty, reset the current preset to this file during reloads."));
 
-		if (ImGui::Checkbox("Load only enabled effects", &_effect_load_skipping))
+		ImGui::Spacing();
+
+		modified |= imgui::path_list(_("Effect search paths"), _effect_search_paths, _file_selection_path, g_reshade_base_path);
+		ImGui::SetItemTooltip(_("List of directory paths to be searched for effect files (.fx).\nPaths that end in \"\\**\" are searched recursively."));
+		modified |= imgui::path_list(_("Texture search paths"), _texture_search_paths, _file_selection_path, g_reshade_base_path);
+		ImGui::SetItemTooltip(_("List of directory paths to be searched for image files used as source for textures.\nPaths that end in \"\\**\" are searched recursively."));
+
+		if (ImGui::Checkbox(_("Load only enabled effects"), &_effect_load_skipping))
 		{
 			modified = true;
 
 			// Force load all effects in case some where skipped after load skipping was disabled
-			_load_option_disable_skipping = !_effect_load_skipping;
-			reload_effects();
+			reload_effects(!_effect_load_skipping);
 		}
 
-		if (ImGui::Button("Clear effect cache", ImVec2(ImGui::CalcItemWidth(), 0)))
+		if (ImGui::Button(_("Clear effect cache"), ImVec2(ImGui::CalcItemWidth(), 0)))
 			clear_effect_cache();
-		if (ImGui::IsItemHovered())
-			ImGui::SetTooltip("Clear effect cache located in \"%s\".", _effect_cache_path.u8string().c_str());
+		ImGui::SetItemTooltip(_("Clear effect cache located in \"%s\"."), _effect_cache_path.u8string().c_str());
 #endif
 	}
 
-	if (ImGui::CollapsingHeader("Screenshots", ImGuiTreeNodeFlags_DefaultOpen))
+	if (ImGui::CollapsingHeader(_("Screenshots"), ImGuiTreeNodeFlags_DefaultOpen))
 	{
 		if (_input != nullptr)
 		{
-			modified |= imgui::key_input_box("Screenshot key", _screenshot_key_data, *_input);
+			modified |= imgui::key_input_box(_("Screenshot key"), _screenshot_key_data, *_input);
 		}
 
-		modified |= imgui::directory_input_box("Screenshot path", _screenshot_path, _file_selection_path);
+		modified |= imgui::directory_input_box(_("Screenshot path"), _screenshot_path, _file_selection_path);
 
-		char name[260] = "";
-		_screenshot_name.copy(name, sizeof(name) - 1);
-		if (ImGui::InputText("Screenshot name", name, sizeof(name)))
+		char name[260];
+		name[_screenshot_name.copy(name, sizeof(name) - 1)] = '\0';
+		if (ImGui::InputText(_("Screenshot name"), name, sizeof(name), ImGuiInputTextFlags_CallbackCharFilter, filter_name))
 		{
 			modified = true;
 			_screenshot_name = name;
 		}
 
-		if (ImGui::IsItemHovered())
+		if (ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip))
 		{
-			ImGui::SetTooltip(
+			ImGui::SetTooltip(_(
 				"Macros you can add that are resolved during saving:\n"
 				"  %%AppName%%         Name of the application (%s)\n"
-#if RESHADE_FX
 				"  %%PresetName%%      File name without extension of the current preset file (%s)\n"
-#endif
 				"  %%Date%%            Current date in format '%s'\n"
 				"  %%DateYear%%        Year component of current date\n"
 				"  %%DateMonth%%       Month component of current date\n"
@@ -1694,51 +2245,55 @@ void reshade::runtime::draw_gui_settings()
 				"  %%TimeHour%%        Hour component of current time\n"
 				"  %%TimeMinute%%      Minute component of current time\n"
 				"  %%TimeSecond%%      Second component of current time\n"
-				"  %%TimeMS%%          Milliseconds fraction of current time",
-				g_target_executable_path.stem().string().c_str(),
+				"  %%TimeMS%%          Milliseconds fraction of current time\n"
+				"  %%Count%%           Number of screenshots taken this session\n"),
+				g_target_executable_path.stem().u8string().c_str(),
 #if RESHADE_FX
-				_current_preset_path.stem().string().c_str(),
+				_current_preset_path.stem().u8string().c_str(),
+#else
+				"..."
 #endif
 				"yyyy-MM-dd",
 				"HH-mm-ss");
 		}
 
-		modified |= ImGui::Combo("Screenshot format", reinterpret_cast<int *>(&_screenshot_format), "Bitmap (*.bmp)\0Portable Network Graphics (*.png)\0JPEG (*.jpeg)\0");
+		modified |= ImGui::Combo(_("Screenshot format"), reinterpret_cast<int *>(&_screenshot_format), "Bitmap (*.bmp)\0Portable Network Graphics (*.png)\0JPEG (*.jpeg)\0");
 
 		if (_screenshot_format == 2)
-			modified |= ImGui::SliderInt("JPEG quality", reinterpret_cast<int *>(&_screenshot_jpeg_quality), 1, 100);
+			modified |= ImGui::SliderInt(_("JPEG quality"), reinterpret_cast<int *>(&_screenshot_jpeg_quality), 1, 100, "%d", ImGuiSliderFlags_AlwaysClamp);
 		else
-			modified |= ImGui::Checkbox("Clear alpha channel", &_screenshot_clear_alpha);
+			modified |= ImGui::Checkbox(_("Clear alpha channel"), &_screenshot_clear_alpha);
 
 #if RESHADE_FX
-		modified |= ImGui::Checkbox("Save current preset file", &_screenshot_include_preset);
-		modified |= ImGui::Checkbox("Save before and after images", &_screenshot_save_before);
+		modified |= ImGui::Checkbox(_("Save current preset file"), &_screenshot_include_preset);
+		modified |= ImGui::Checkbox(_("Save before and after images"), &_screenshot_save_before);
 #endif
-		modified |= ImGui::Checkbox("Save separate image with the overlay visible", &_screenshot_save_gui);
+		modified |= ImGui::Checkbox(_("Save separate image with the overlay visible"), &_screenshot_save_gui);
 
-		modified |= imgui::file_input_box("Post-save command", _screenshot_post_save_command, _screenshot_post_save_command, { L".exe" });
+		modified |= imgui::file_input_box(_("Screenshot sound"), "sound.wav", _screenshot_sound_path, _file_selection_path, { L".wav" });
+		ImGui::SetItemTooltip(_("Audio file that is played when taking a screenshot."));
 
-		if (ImGui::IsItemHovered())
-			ImGui::SetTooltip("Executable that is called after saving a screenshot.\nThis can be used to perform additional processing on the image (e.g. compressing it with an image optimizer).");
+		modified |= imgui::file_input_box(_("Post-save command"), "command.exe", _screenshot_post_save_command, _file_selection_path, { L".exe" });
+		ImGui::SetItemTooltip(_(
+			"Executable that is called after saving a screenshot.\n"
+			"This can be used to perform additional processing on the image (e.g. compressing it with an image optimizer)."));
 
-		char arguments[260] = "";
-		_screenshot_post_save_command_arguments.copy(arguments, sizeof(arguments) - 1);
-		if (ImGui::InputText("Post-save command arguments", arguments, sizeof(arguments)))
+		char arguments[260];
+		arguments[_screenshot_post_save_command_arguments.copy(arguments, sizeof(arguments) - 1)] = '\0';
+		if (ImGui::InputText(_("Post-save command arguments"), arguments, sizeof(arguments)))
 		{
 			modified = true;
 			_screenshot_post_save_command_arguments = arguments;
 		}
 
-		if (ImGui::IsItemHovered())
+		if (ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip))
 		{
 			const std::string extension = _screenshot_format == 0 ? ".bmp" : _screenshot_format == 1 ? ".png" : ".jpg";
 
-			ImGui::SetTooltip(
+			ImGui::SetTooltip(_(
 				"Macros you can add that are resolved during command execution:\n"
 				"  %%AppName%%         Name of the application (%s)\n"
-#if RESHADE_FX
 				"  %%PresetName%%      File name without extension of the current preset file (%s)\n"
-#endif
 				"  %%Date%%            Current date in format '%s'\n"
 				"  %%DateYear%%        Year component of current date\n"
 				"  %%DateMonth%%       Month component of current date\n"
@@ -1752,10 +2307,13 @@ void reshade::runtime::draw_gui_settings()
 				"  %%TargetDir%%       Full path to the screenshot directory (%s)\n"
 				"  %%TargetFileName%%  File name of the screenshot file (%s)\n"
 				"  %%TargetExt%%       File extension of the screenshot file (%s)\n"
-				"  %%TargetName%%      File name without extension of the screenshot file (%s)",
-				g_target_executable_path.stem().string().c_str(),
+				"  %%TargetName%%      File name without extension of the screenshot file (%s)\n"
+				"  %%Count%%           Number of screenshots taken this session\n"),
+				g_target_executable_path.stem().u8string().c_str(),
 #if RESHADE_FX
-				_current_preset_path.stem().string().c_str(),
+				_current_preset_path.stem().u8string().c_str(),
+#else
+				"..."
 #endif
 				"yyyy-MM-dd",
 				"HH-mm-ss",
@@ -1766,31 +2324,60 @@ void reshade::runtime::draw_gui_settings()
 				_screenshot_name.c_str());
 		}
 
-		modified |= imgui::directory_input_box("Post-save command working directory", _screenshot_post_save_command_working_directory, _file_selection_path);
-		modified |= ImGui::Checkbox("Hide post-save command window", &_screenshot_post_save_command_no_window);
+		modified |= imgui::directory_input_box(_("Post-save command working directory"), _screenshot_post_save_command_working_directory, _file_selection_path);
+		modified |= ImGui::Checkbox(_("Hide post-save command window"), &_screenshot_post_save_command_hide_window);
 	}
 
-	if (ImGui::CollapsingHeader("Overlay & Styling", ImGuiTreeNodeFlags_DefaultOpen))
+	if (ImGui::CollapsingHeader(_("Overlay & Styling"), ImGuiTreeNodeFlags_DefaultOpen))
 	{
+#if RESHADE_LOCALIZATION
+		{
+			std::vector<std::string> languages = resources::get_languages();
+
+			int lang_index = 0;
+			if (const auto it = std::find(languages.begin(), languages.end(), _selected_language); it != languages.end())
+				lang_index = static_cast<int>(std::distance(languages.begin(), it) + 1);
+
+			if (ImGui::Combo(_("Language"), &lang_index,
+					[](void *data, int idx) -> const char * {
+						return idx == 0 ? "System Default" : (*static_cast<const std::vector<std::string> *>(data))[idx - 1].c_str();
+					}, &languages, static_cast<int>(languages.size() + 1)))
+			{
+				modified = true;
+				if (lang_index == 0)
+					_selected_language.clear();
+				else
+					_selected_language = languages[lang_index - 1];
+				// Rebuild font atlas in case language needs a special font or glyph range
+				_imgui_context->IO.Fonts->TexReady = false;
+			}
+		}
+#endif
+
 #if RESHADE_FX
-		if (ImGui::Button("Restart tutorial", ImVec2(ImGui::CalcItemWidth(), 0)))
+		if (ImGui::Button(_("Restart tutorial"), ImVec2(ImGui::CalcItemWidth(), 0)))
 			_tutorial_index = 0;
 #endif
 
-		modified |= ImGui::Checkbox("Show screenshot message", &_show_screenshot_message);
+		modified |= ImGui::Checkbox(_("Show screenshot message"), &_show_screenshot_message);
 
 #if RESHADE_FX
+		ImGui::BeginDisabled(_preset_transition_duration == 0);
+		modified |= ImGui::Checkbox(_("Show preset transition message"), &_show_preset_transition_message);
+		ImGui::EndDisabled();
+		if (_preset_transition_duration == 0 && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled | ImGuiHoveredFlags_ForTooltip))
+			ImGui::SetTooltip(_("Preset transition duration has to be non-zero for the preset transition message to show up."));
+
 		if (_effect_load_skipping)
-			modified |= ImGui::Checkbox("Show \"Force load all effects\" button", &_show_force_load_effects_button);
+			modified |= ImGui::Checkbox(_("Show \"Force load all effects\" button"), &_show_force_load_effects_button);
 #endif
 
 #if RESHADE_FX
-		modified |= ImGui::Checkbox("Group effect files with tabs instead of a tree", &_variable_editor_tabs);
-		modified |= ImGui::Checkbox("Save current preset automatically on every modification", &_save_present_on_modification);
+		modified |= ImGui::Checkbox(_("Group effect files with tabs instead of a tree"), &_variable_editor_tabs);
 #endif
 
 		#pragma region Style
-		if (ImGui::Combo("Global style", &_style_index, "Dark\0Light\0Default\0Custom Simple\0Custom Advanced\0Solarized Dark\0Solarized Light\0"))
+		if (ImGui::Combo(_("Global style"), &_style_index, "Dark\0Light\0Default\0Custom Simple\0Custom Advanced\0Solarized Dark\0Solarized Light\0"))
 		{
 			modified = true;
 			load_custom_style();
@@ -1800,7 +2387,7 @@ void reshade::runtime::draw_gui_settings()
 		{
 			ImVec4 *const colors = _imgui_context->Style.Colors;
 
-			if (ImGui::BeginChild("##colors", ImVec2(0, 105), true, ImGuiWindowFlags_AlwaysVerticalScrollbar | ImGuiWindowFlags_NavFlattened))
+			if (ImGui::BeginChild("##colors", ImVec2(0, 105), ImGuiChildFlags_Border, ImGuiWindowFlags_AlwaysVerticalScrollbar | ImGuiWindowFlags_NavFlattened))
 			{
 				ImGui::PushItemWidth(-160);
 				modified_custom_style |= ImGui::ColorEdit3("Background", &colors[ImGuiCol_WindowBg].x);
@@ -1862,14 +2449,15 @@ void reshade::runtime::draw_gui_settings()
 		}
 		if (_style_index == 4) // Custom Advanced
 		{
-			if (ImGui::BeginChild("##colors", ImVec2(0, 300), true, ImGuiWindowFlags_AlwaysVerticalScrollbar | ImGuiWindowFlags_NavFlattened))
+			if (ImGui::BeginChild("##colors", ImVec2(0, 300), ImGuiChildFlags_Border, ImGuiWindowFlags_AlwaysVerticalScrollbar | ImGuiWindowFlags_NavFlattened))
 			{
 				ImGui::PushItemWidth(-160);
 				for (ImGuiCol i = 0; i < ImGuiCol_COUNT; i++)
 				{
 					ImGui::PushID(i);
 					modified_custom_style |= ImGui::ColorEdit4("##color", &_imgui_context->Style.Colors[i].x, ImGuiColorEditFlags_AlphaBar | ImGuiColorEditFlags_AlphaPreview);
-					ImGui::SameLine(); ImGui::TextUnformatted(ImGui::GetStyleColorName(i));
+					ImGui::SameLine();
+					ImGui::TextUnformatted(ImGui::GetStyleColorName(i));
 					ImGui::PopID();
 				}
 				ImGui::PopItemWidth();
@@ -1879,7 +2467,7 @@ void reshade::runtime::draw_gui_settings()
 		#pragma endregion
 
 		#pragma region Editor Style
-		if (ImGui::Combo("Text editor style", &_editor_style_index, "Dark\0Light\0Custom\0Solarized Dark\0Solarized Light\0"))
+		if (ImGui::Combo(_("Text editor style"), &_editor_style_index, "Dark\0Light\0Custom\0Solarized Dark\0Solarized Light\0"))
 		{
 			modified = true;
 			load_custom_style();
@@ -1887,7 +2475,7 @@ void reshade::runtime::draw_gui_settings()
 
 		if (_editor_style_index == 2)
 		{
-			if (ImGui::BeginChild("##editor_colors", ImVec2(0, 300), true, ImGuiWindowFlags_AlwaysVerticalScrollbar | ImGuiWindowFlags_NavFlattened))
+			if (ImGui::BeginChild("##editor_colors", ImVec2(0, 300), ImGuiChildFlags_Border, ImGuiWindowFlags_AlwaysVerticalScrollbar | ImGuiWindowFlags_NavFlattened))
 			{
 				ImGui::PushItemWidth(-160);
 				for (ImGuiCol i = 0; i < imgui::code_editor::color_palette_max; i++)
@@ -1895,7 +2483,8 @@ void reshade::runtime::draw_gui_settings()
 					ImVec4 color = ImGui::ColorConvertU32ToFloat4(_editor_palette[i]);
 					ImGui::PushID(i);
 					modified_custom_style |= ImGui::ColorEdit4("##editor_color", &color.x, ImGuiColorEditFlags_AlphaBar | ImGuiColorEditFlags_AlphaPreview);
-					ImGui::SameLine(); ImGui::TextUnformatted(imgui::code_editor::get_palette_color_name(i));
+					ImGui::SameLine();
+					ImGui::TextUnformatted(imgui::code_editor::get_palette_color_name(i));
 					ImGui::PopID();
 					_editor_palette[i] = ImGui::ColorConvertFloat4ToU32(color);
 				}
@@ -1905,49 +2494,86 @@ void reshade::runtime::draw_gui_settings()
 		}
 		#pragma endregion
 
-		if (imgui::font_input_box("Global font", _font, _file_selection_path, _font_size))
+		if (imgui::font_input_box(_("Global font"), _default_font_path.empty() ? "ProggyClean.ttf" : _default_font_path.u8string().c_str(), _font_path, _file_selection_path, _font_size))
 		{
 			modified = true;
-			_rebuild_font_atlas = true;
+			_imgui_context->IO.Fonts->TexReady = false;
 		}
 
-		if (imgui::font_input_box("Text editor font", _editor_font, _file_selection_path, _editor_font_size))
+		if (_imgui_context->IO.Fonts->Fonts[0]->ConfigDataCount > 2 && // Latin font + main font + icon font
+			imgui::font_input_box(_("Latin font"), "ProggyClean.ttf", _latin_font_path, _file_selection_path, _font_size))
 		{
 			modified = true;
-			_rebuild_font_atlas = true;
+			_imgui_context->IO.Fonts->TexReady = false;
 		}
 
-		if (float &alpha = _imgui_context->Style.Alpha; ImGui::SliderFloat("Global alpha", &alpha, 0.1f, 1.0f, "%.2f"))
+		if (imgui::font_input_box(_("Text editor font"), _default_editor_font_path.empty() ? "ProggyClean.ttf" : _default_editor_font_path.u8string().c_str(), _editor_font_path, _file_selection_path, _editor_font_size))
+		{
+			modified = true;
+			_imgui_context->IO.Fonts->TexReady = false;
+		}
+
+		if (float &alpha = _imgui_context->Style.Alpha; ImGui::SliderFloat(_("Global alpha"), &alpha, 0.1f, 1.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp))
 		{
 			// Prevent user from setting alpha to zero
 			alpha = std::max(alpha, 0.1f);
 			modified = true;
 		}
 
-		if (float &rounding = _imgui_context->Style.FrameRounding; ImGui::SliderFloat("Frame rounding", &rounding, 0.0f, 12.0f, "%.0f"))
+		// Only show on possible HDR swap chains
+		if (((_renderer_id & 0xB000) == 0xB000 || (_renderer_id & 0xC000) == 0xC000 || (_renderer_id & 0x20000) == 0x20000) &&
+			(_back_buffer_format == reshade::api::format::r10g10b10a2_unorm || _back_buffer_format == reshade::api::format::b10g10r10a2_unorm || _back_buffer_format == reshade::api::format::r16g16b16a16_float))
+		{
+			if (ImGui::SliderFloat(_("HDR overlay brightness"), &_hdr_overlay_brightness, 20.f, 400.f, "%.0f nits", ImGuiSliderFlags_AlwaysClamp))
+				modified = true;
+
+			if (ImGui::Combo(_("Overlay color space"), reinterpret_cast<int *>(&_hdr_overlay_overwrite_color_space), "Auto\0SDR\0scRGB\0HDR10\0HLG\0"))
+				modified = true;
+		}
+
+		if (float &rounding = _imgui_context->Style.FrameRounding; ImGui::SliderFloat(_("Frame rounding"), &rounding, 0.0f, 12.0f, "%.0f", ImGuiSliderFlags_AlwaysClamp))
 		{
 			// Apply the same rounding to everything
-			_imgui_context->Style.GrabRounding = _imgui_context->Style.TabRounding = _imgui_context->Style.ScrollbarRounding = rounding;
-			_imgui_context->Style.WindowRounding = _imgui_context->Style.ChildRounding = _imgui_context->Style.PopupRounding = rounding;
+			_imgui_context->Style.WindowRounding = rounding;
+			_imgui_context->Style.ChildRounding = rounding;
+			_imgui_context->Style.PopupRounding = rounding;
+			_imgui_context->Style.ScrollbarRounding = rounding;
+			_imgui_context->Style.GrabRounding = rounding;
+			_imgui_context->Style.TabRounding = rounding;
 			modified = true;
 		}
 
 		if (!_is_vr)
 		{
-			ImGui::BeginGroup();
-			modified |= imgui::checkbox_tristate("Show clock", &_show_clock);
-			ImGui::SameLine(0, 10);
-			modified |= imgui::checkbox_tristate("Show FPS", &_show_fps);
-			ImGui::SameLine(0, 10);
-			modified |= imgui::checkbox_tristate("Show frame time", &_show_frametime);
-			ImGui::EndGroup();
-			if (ImGui::IsItemHovered())
-				ImGui::SetTooltip("Check to always show, fill out to only show while overlay is open");
+			ImGui::Spacing();
 
-			modified |= ImGui::Combo("Clock format", reinterpret_cast<int *>(&_clock_format), "HH:mm\0HH:mm:ss\0");
-			modified |= ImGui::SliderFloat("OSD text size", &_fps_scale, 0.2f, 2.5f, "%.1f");
-			modified |= ImGui::ColorEdit4("OSD text color", _fps_col, ImGuiColorEditFlags_AlphaBar | ImGuiColorEditFlags_AlphaPreview);
-			modified |= ImGui::Combo("Position on screen", reinterpret_cast<int *>(&_fps_pos), "Top Left\0Top Right\0Bottom Left\0Bottom Right\0");
+			ImGui::BeginGroup();
+			modified |= imgui::checkbox_tristate(_("Show clock"), &_show_clock);
+			ImGui::SameLine(0, 10);
+			modified |= imgui::checkbox_tristate(_("Show FPS"), &_show_fps);
+			ImGui::SameLine(0, 10);
+			modified |= imgui::checkbox_tristate(_("Show frame time"), &_show_frametime);
+#if RESHADE_FX
+			modified |= imgui::checkbox_tristate(_("Show preset name"), &_show_preset_name);
+#endif
+			ImGui::EndGroup();
+			ImGui::SetItemTooltip(_("Check to always show, fill out to only show while overlay is open."));
+
+			if (_input != nullptr)
+			{
+				modified |= imgui::key_input_box(_("FPS key"), _fps_key_data, *_input);
+				modified |= imgui::key_input_box(_("Frame time key"), _frametime_key_data, *_input);
+			}
+
+			if (_show_clock)
+				modified |= ImGui::Combo(_("Clock format"), reinterpret_cast<int *>(&_clock_format), "HH:mm\0HH:mm:ss\0yyyy-MM-dd HH:mm:ss\0");
+
+			modified |= ImGui::SliderFloat(_("OSD text size"), &_fps_scale, 0.2f, 2.5f, "%.1f", ImGuiSliderFlags_AlwaysClamp);
+			modified |= ImGui::ColorEdit4(_("OSD text color"), _fps_col, ImGuiColorEditFlags_AlphaBar | ImGuiColorEditFlags_AlphaPreview);
+
+			std::string fps_pos_items = _("Top left\nTop right\nBottom left\nBottom right\n");
+			std::replace(fps_pos_items.begin(), fps_pos_items.end(), '\n', '\0');
+			modified |= ImGui::Combo(_("OSD position on screen"), reinterpret_cast<int *>(&_fps_pos), fps_pos_items.c_str());
 		}
 	}
 
@@ -1976,7 +2602,7 @@ void reshade::runtime::draw_gui_statistics()
 	}
 #endif
 
-	if (ImGui::CollapsingHeader("General", ImGuiTreeNodeFlags_DefaultOpen))
+	if (ImGui::CollapsingHeader(_("General"), ImGuiTreeNodeFlags_DefaultOpen))
 	{
 #if RESHADE_FX
 		_gather_gpu_statistics = true;
@@ -1984,11 +2610,11 @@ void reshade::runtime::draw_gui_statistics()
 
 		ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
 		ImGui::PlotLines("##framerate",
-			_imgui_context->FramerateSecPerFrame, 120,
+			_imgui_context->FramerateSecPerFrame, static_cast<int>(std::size(_imgui_context->FramerateSecPerFrame)),
 			_imgui_context->FramerateSecPerFrameIdx,
 			nullptr,
-			_imgui_context->FramerateSecPerFrameAccum / 120 * 0.5f,
-			_imgui_context->FramerateSecPerFrameAccum / 120 * 1.5f,
+			_imgui_context->FramerateSecPerFrameAccum / static_cast<int>(std::size(_imgui_context->FramerateSecPerFrame)) * 0.5f,
+			_imgui_context->FramerateSecPerFrameAccum / static_cast<int>(std::size(_imgui_context->FramerateSecPerFrame)) * 1.5f,
 			ImVec2(0, 50));
 
 		const std::time_t t = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
@@ -1996,13 +2622,16 @@ void reshade::runtime::draw_gui_statistics()
 
 		ImGui::BeginGroup();
 
-		ImGui::TextUnformatted("API:");
-		ImGui::TextUnformatted("Hardware:");
-		ImGui::TextUnformatted("Application:");
-		ImGui::TextUnformatted("Time:");
-		ImGui::Text("Frame %llu:", _frame_count + 1);
+		ImGui::TextUnformatted(_("API:"));
+		ImGui::TextUnformatted(_("Hardware:"));
+		ImGui::TextUnformatted(_("Application:"));
+		ImGui::TextUnformatted(_("Time:"));
 #if RESHADE_FX
-		ImGui::TextUnformatted("Post-Processing:");
+		ImGui::TextUnformatted(_("Resolution:"));
+#endif
+		ImGui::Text(_("Frame %llu:"), _frame_count + 1);
+#if RESHADE_FX
+		ImGui::TextUnformatted(_("Post-Processing:"));
 #endif
 
 		ImGui::EndGroup();
@@ -2038,7 +2667,10 @@ void reshade::runtime::draw_gui_statistics()
 		else
 			ImGui::TextUnformatted("Unknown");
 		ImGui::TextUnformatted(g_target_executable_path.filename().u8string().c_str());
-		ImGui::Text("%d-%d-%d %d", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour * 3600 + tm.tm_min * 60 + tm.tm_sec);
+		ImGui::Text("%.4d-%.2d-%.2d %d", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour * 3600 + tm.tm_min * 60 + tm.tm_sec);
+#if RESHADE_FX
+		ImGui::Text("%ux%u", _effect_width, _effect_height);
+#endif
 		ImGui::Text("%.2f fps", _imgui_context->IO.Framerate);
 #if RESHADE_FX
 		ImGui::Text("%*.3f ms CPU", cpu_digits + 4, post_processing_time_cpu * 1e-6f);
@@ -2053,8 +2685,11 @@ void reshade::runtime::draw_gui_statistics()
 			ImGui::Text("DEV_%X", _device_id);
 		else
 			ImGui::TextUnformatted("Unknown");
-		ImGui::Text("0x%X", std::hash<std::string>()(g_target_executable_path.stem().u8string()) & 0xFFFFFFFF);
+		ImGui::Text("0x%X", static_cast<unsigned int>(std::hash<std::string>()(g_target_executable_path.stem().u8string()) & 0xFFFFFFFF));
 		ImGui::Text("%.0f ms", std::chrono::duration_cast<std::chrono::nanoseconds>(_last_present_time - _start_time).count() * 1e-6f);
+#if RESHADE_FX
+		ImGui::Text("Format %u (%u bpc)", static_cast<unsigned int>(_effect_color_format), api::format_bit_depth(_effect_color_format));
+#endif
 		ImGui::Text("%*.3f ms", gpu_digits + 4, _last_frame_duration.count() * 1e-6f);
 #if RESHADE_FX
 		if (_gather_gpu_statistics && post_processing_time_gpu != 0)
@@ -2065,32 +2700,44 @@ void reshade::runtime::draw_gui_statistics()
 	}
 
 #if RESHADE_FX
-	if (ImGui::CollapsingHeader("Techniques", ImGuiTreeNodeFlags_DefaultOpen) && !is_loading() && _effects_enabled)
+	if (ImGui::CollapsingHeader(_("Techniques"), ImGuiTreeNodeFlags_DefaultOpen) && !is_loading() && _effects_enabled)
 	{
 		// Only need to gather GPU statistics if the statistics are actually visible
 		_gather_gpu_statistics = true;
 
 		ImGui::BeginGroup();
 
-		for (const technique &tech : _techniques)
+		std::vector<bool> long_technique_name(_techniques.size());
+		for (size_t technique_index : _technique_sorting)
 		{
+			const reshade::technique &tech = _techniques[technique_index];
+
 			if (!tech.enabled)
 				continue;
 
 			if (tech.passes.size() > 1)
 				ImGui::Text("%s (%zu passes)", tech.name.c_str(), tech.passes.size());
 			else
-				ImGui::TextUnformatted(tech.name.c_str());
+				ImGui::TextUnformatted(tech.name.c_str(), tech.name.c_str() + tech.name.size());
+
+			long_technique_name[technique_index] = (ImGui::GetItemRectSize().x + 10.0f) > (ImGui::GetWindowWidth() * 0.33333333f);
+			if (long_technique_name[technique_index])
+				ImGui::NewLine();
 		}
 
 		ImGui::EndGroup();
 		ImGui::SameLine(ImGui::GetWindowWidth() * 0.33333333f);
 		ImGui::BeginGroup();
 
-		for (const technique &tech : _techniques)
+		for (size_t technique_index : _technique_sorting)
 		{
+			const reshade::technique &tech = _techniques[technique_index];
+
 			if (!tech.enabled)
 				continue;
+
+			if (long_technique_name[technique_index])
+				ImGui::NewLine();
 
 			if (tech.average_cpu_duration != 0)
 				ImGui::Text("%*.3f ms CPU", cpu_digits + 4, tech.average_cpu_duration * 1e-6f);
@@ -2102,10 +2749,15 @@ void reshade::runtime::draw_gui_statistics()
 		ImGui::SameLine(ImGui::GetWindowWidth() * 0.66666666f);
 		ImGui::BeginGroup();
 
-		for (const technique &tech : _techniques)
+		for (size_t technique_index : _technique_sorting)
 		{
+			const reshade::technique &tech = _techniques[technique_index];
+
 			if (!tech.enabled)
 				continue;
+
+			if (long_technique_name[technique_index])
+				ImGui::NewLine();
 
 			// GPU timings are not available for all APIs
 			if (_gather_gpu_statistics && tech.average_gpu_duration != 0)
@@ -2117,22 +2769,22 @@ void reshade::runtime::draw_gui_statistics()
 		ImGui::EndGroup();
 	}
 
-	if (ImGui::CollapsingHeader("Render Targets & Textures", ImGuiTreeNodeFlags_DefaultOpen) && !is_loading())
+	if (ImGui::CollapsingHeader(_("Render Targets & Textures"), ImGuiTreeNodeFlags_DefaultOpen) && !is_loading())
 	{
 		static const char *texture_formats[] = {
 			"unknown",
-			"R8", "R16", "R16F", "R32F", "RG8", "RG16", "RG16F", "RG32F", "RGBA8", "RGBA16", "RGBA16F", "RGBA32F", "RGB10A2"
+			"R8", "R16", "R16F", "R32I", "R32U", "R32F", "RG8", "RG16", "RG16F", "RG32F", "RGBA8", "RGBA16", "RGBA16F", "RGBA32F", "RGB10A2"
 		};
 		static constexpr uint32_t pixel_sizes[] = {
 			0,
-			1 /*R8*/, 2 /*R16*/, 2 /*R16F*/, 4 /*R32F*/, 2 /*RG8*/, 4 /*RG16*/, 4 /*RG16F*/, 8 /*RG32F*/, 4 /*RGBA8*/, 8 /*RGBA16*/, 8 /*RGBA16F*/, 16 /*RGBA32F*/, 4 /*RGB10A2*/
+			1 /*R8*/, 2 /*R16*/, 2 /*R16F*/, 4 /*R32I*/, 4 /*R32U*/, 4 /*R32F*/, 2 /*RG8*/, 4 /*RG16*/, 4 /*RG16F*/, 8 /*RG32F*/, 4 /*RGBA8*/, 8 /*RGBA16*/, 8 /*RGBA16F*/, 16 /*RGBA32F*/, 4 /*RGB10A2*/
 		};
 
 		static_assert((std::size(texture_formats) - 1) == static_cast<size_t>(reshadefx::texture_format::rgb10a2));
 
 		const float total_width = ImGui::GetContentRegionAvail().x;
 		int texture_index = 0;
-		const unsigned int num_columns = static_cast<unsigned int>(std::ceilf(total_width / (55.0f * _font_size)));
+		const unsigned int num_columns = std::max(1u, static_cast<unsigned int>(std::ceil(total_width / (55.0f * _font_size))));
 		const float single_image_width = (total_width / num_columns) - 5.0f;
 
 		// Variables used to calculate memory size of textures
@@ -2142,15 +2794,17 @@ void reshade::runtime::draw_gui_statistics()
 
 		for (const texture &tex : _textures)
 		{
-			if (tex.resource == 0 || !tex.semantic.empty() || !std::any_of(tex.shared.begin(), tex.shared.end(), [this](size_t effect_index) { return _effects[effect_index].rendering; }))
+			if (tex.resource == 0 || !tex.semantic.empty() ||
+				!std::any_of(tex.shared.cbegin(), tex.shared.cend(),
+					[this](size_t effect_index) { return _effects[effect_index].rendering; }))
 				continue;
 
 			ImGui::PushID(texture_index);
 			ImGui::BeginGroup();
 
 			int64_t memory_size = 0;
-			for (uint32_t level = 0, width = tex.width, height = tex.height; level < tex.levels; ++level, width /= 2, height /= 2)
-				memory_size += static_cast<size_t>(width) * static_cast<size_t>(height) * pixel_sizes[static_cast<int>(tex.format)];
+			for (uint32_t level = 0, width = tex.width, height = tex.height, depth = tex.depth; level < tex.levels; ++level, width /= 2, height /= 2, depth /= 2)
+				memory_size += static_cast<size_t>(width) * static_cast<size_t>(height) * static_cast<size_t>(depth) * pixel_sizes[static_cast<int>(tex.format)];
 
 			post_processing_memory_size += memory_size;
 
@@ -2166,19 +2820,40 @@ void reshade::runtime::draw_gui_statistics()
 				memory_size_unit = "KiB";
 			}
 
-			ImGui::TextColored(ImVec4(1, 1, 1, 1), "%s%s", tex.unique_name.c_str(), tex.shared.size() > 1 ? " (Pooled)" : "");
-			ImGui::Text("%ux%u | %u mipmap(s) | %s | %lld.%03lld %s",
-				tex.width,
-				tex.height,
-				tex.levels - 1,
-				texture_formats[static_cast<int>(tex.format)],
-				memory_view.quot, memory_view.rem, memory_size_unit);
+			ImGui::TextColored(ImVec4(1, 1, 1, 1), "%s%s", tex.unique_name.c_str(), tex.shared.size() > 1 ? " (pooled)" : "");
+			switch (tex.type)
+			{
+			case reshadefx::texture_type::texture_1d:
+				ImGui::Text("%u | %u mipmap(s) | %s | %lld.%03lld %s",
+					tex.width,
+					tex.levels - 1,
+					texture_formats[static_cast<int>(tex.format)],
+					memory_view.quot, memory_view.rem, memory_size_unit);
+				break;
+			case reshadefx::texture_type::texture_2d:
+				ImGui::Text("%ux%u | %u mipmap(s) | %s | %lld.%03lld %s",
+					tex.width,
+					tex.height,
+					tex.levels - 1,
+					texture_formats[static_cast<int>(tex.format)],
+					memory_view.quot, memory_view.rem, memory_size_unit);
+				break;
+			case reshadefx::texture_type::texture_3d:
+				ImGui::Text("%ux%ux%u | %u mipmap(s) | %s | %lld.%03lld %s",
+					tex.width,
+					tex.height,
+					tex.depth,
+					tex.levels - 1,
+					texture_formats[static_cast<int>(tex.format)],
+					memory_view.quot, memory_view.rem, memory_size_unit);
+				break;
+			}
 
 			size_t num_referenced_passes = 0;
 			std::vector<std::pair<size_t, std::vector<std::string>>> references;
 			for (const technique &tech : _techniques)
 			{
-				if (std::find(tex.shared.begin(), tex.shared.end(), tech.effect_index) == tex.shared.end())
+				if (std::find(tex.shared.cbegin(), tex.shared.cend(), tech.effect_index) == tex.shared.cend())
 					continue;
 
 				std::pair<size_t, std::vector<std::string>> &reference = references.emplace_back();
@@ -2192,9 +2867,9 @@ void reshade::runtime::draw_gui_statistics()
 					pass_name = tech.name + ' ' + pass_name;
 
 					bool referenced = false;
-					for (const reshadefx::sampler_info &sampler : tech.passes[pass_index].samplers)
+					for (const reshadefx::texture_binding &binding : tech.passes[pass_index].texture_bindings)
 					{
-						if (sampler.texture_name == tex.unique_name)
+						if (_effects[tech.effect_index].module.samplers[binding.index].texture_name == tex.unique_name)
 						{
 							referenced = true;
 							reference.second.emplace_back(pass_name + " (sampler)");
@@ -2202,9 +2877,9 @@ void reshade::runtime::draw_gui_statistics()
 						}
 					}
 
-					for (const reshadefx::storage_info &storage : tech.passes[pass_index].storages)
+					for (const reshadefx::storage_binding &binding : tech.passes[pass_index].storage_bindings)
 					{
-						if (storage.texture_name == tex.unique_name)
+						if (_effects[tech.effect_index].module.storages[binding.index].texture_name == tex.unique_name)
 						{
 							referenced = true;
 							reference.second.emplace_back(pass_name + " (storage)");
@@ -2227,7 +2902,8 @@ void reshade::runtime::draw_gui_statistics()
 				}
 			}
 
-			const bool supports_saving = (
+			const bool supports_saving =
+				tex.type != reshadefx::texture_type::texture_3d && (
 				tex.format == reshadefx::texture_format::r8 ||
 				tex.format == reshadefx::texture_format::rg8 ||
 				tex.format == reshadefx::texture_format::rgba8 ||
@@ -2244,8 +2920,7 @@ void reshade::runtime::draw_gui_statistics()
 				ImGui::SameLine(0, button_spacing);
 				if (ImGui::Button(ICON_FK_FLOPPY, ImVec2(button_size, 0)))
 					save_texture(tex);
-				if (ImGui::IsItemHovered())
-					ImGui::SetTooltip("Save %s", tex.unique_name.c_str());
+				ImGui::SetItemTooltip(_("Save %s"), tex.unique_name.c_str());
 			}
 			ImGui::PopStyleVar();
 
@@ -2276,47 +2951,50 @@ void reshade::runtime::draw_gui_statistics()
 				ImGui::EndPopup();
 			}
 
-			if (bool check = _preview_texture == tex.srv[0] && _preview_size[0] == 0; ImGui::RadioButton("Preview scaled", check))
+			if (tex.type == reshadefx::texture_type::texture_2d)
 			{
-				_preview_size[0] = 0;
-				_preview_size[1] = 0;
-				_preview_texture = !check ? tex.srv[0] : api::resource_view { 0 };
-			}
-			ImGui::SameLine();
-			if (bool check = _preview_texture == tex.srv[0] && _preview_size[0] != 0; ImGui::RadioButton("Preview original", check))
-			{
-				_preview_size[0] = tex.width;
-				_preview_size[1] = tex.height;
-				_preview_texture = !check ? tex.srv[0] : api::resource_view { 0 };
-			}
+				if (bool check = _preview_texture == tex.srv[0] && _preview_size[0] == 0; ImGui::RadioButton(_("Preview scaled"), check))
+				{
+					_preview_size[0] = 0;
+					_preview_size[1] = 0;
+					_preview_texture = !check ? tex.srv[0] : api::resource_view { 0 };
+				}
+				ImGui::SameLine();
+				if (bool check = _preview_texture == tex.srv[0] && _preview_size[0] != 0; ImGui::RadioButton(_("Preview original"), check))
+				{
+					_preview_size[0] = tex.width;
+					_preview_size[1] = tex.height;
+					_preview_texture = !check ? tex.srv[0] : api::resource_view { 0 };
+				}
 
-			bool r = (_preview_size[2] & 0x000000FF) != 0;
-			bool g = (_preview_size[2] & 0x0000FF00) != 0;
-			bool b = (_preview_size[2] & 0x00FF0000) != 0;
-			ImGui::SameLine();
-			ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(_imgui_context->Style.FramePadding.x, 0));
-			ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(1, 0, 0, 1));
-			imgui::toggle_button("R", r, 0.0f, ImGuiButtonFlags_AlignTextBaseLine);
-			ImGui::PopStyleColor();
-			if (tex.format >= reshadefx::texture_format::rg8)
-			{
-				ImGui::SameLine(0, 1);
-				ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0, 1, 0, 1));
-				imgui::toggle_button("G", g, 0.0f, ImGuiButtonFlags_AlignTextBaseLine);
+				bool r = (_preview_size[2] & 0x000000FF) != 0;
+				bool g = (_preview_size[2] & 0x0000FF00) != 0;
+				bool b = (_preview_size[2] & 0x00FF0000) != 0;
+				ImGui::SameLine();
+				ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(_imgui_context->Style.FramePadding.x, 0));
+				ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(1, 0, 0, 1));
+				imgui::toggle_button("R", r, 0.0f, ImGuiButtonFlags_AlignTextBaseLine);
 				ImGui::PopStyleColor();
-				if (tex.format >= reshadefx::texture_format::rgba8)
+				if (tex.format >= reshadefx::texture_format::rg8)
 				{
 					ImGui::SameLine(0, 1);
-					ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0, 0, 1, 1));
-					imgui::toggle_button("B", b, 0.0f, ImGuiButtonFlags_AlignTextBaseLine);
+					ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0, 1, 0, 1));
+					imgui::toggle_button("G", g, 0.0f, ImGuiButtonFlags_AlignTextBaseLine);
 					ImGui::PopStyleColor();
+					if (tex.format >= reshadefx::texture_format::rgba8)
+					{
+						ImGui::SameLine(0, 1);
+						ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0, 0, 1, 1));
+						imgui::toggle_button("B", b, 0.0f, ImGuiButtonFlags_AlignTextBaseLine);
+						ImGui::PopStyleColor();
+					}
 				}
-			}
-			ImGui::PopStyleVar();
-			_preview_size[2] = (r ? 0x000000FF : 0) | (g ? 0x0000FF00 : 0) | (b ? 0x00FF0000 : 0) | 0xFF000000;
+				ImGui::PopStyleVar();
+				_preview_size[2] = (r ? 0x000000FF : 0) | (g ? 0x0000FF00 : 0) | (b ? 0x00FF0000 : 0) | 0xFF000000;
 
-			const float aspect_ratio = static_cast<float>(tex.width) / static_cast<float>(tex.height);
-			imgui::image_with_checkerboard_background(tex.srv[0].handle, ImVec2(single_image_width, single_image_width / aspect_ratio), _preview_size[2]);
+				const float aspect_ratio = static_cast<float>(tex.width) / static_cast<float>(tex.height);
+				imgui::image_with_checkerboard_background(tex.srv[0].handle, ImVec2(single_image_width, single_image_width / aspect_ratio), _preview_size[2]);
+			}
 
 			ImGui::EndGroup();
 			ImGui::PopID();
@@ -2344,46 +3022,48 @@ void reshade::runtime::draw_gui_statistics()
 			memory_size_unit = "KiB";
 		}
 
-		ImGui::Text("Total memory usage: %lld.%03lld %s", memory_view.quot, memory_view.rem, memory_size_unit);
+		ImGui::Text(_("Total memory usage: %lld.%03lld %s"), memory_view.quot, memory_view.rem, memory_size_unit);
 	}
 #endif
 }
 void reshade::runtime::draw_gui_log()
 {
 	std::error_code ec;
-	const std::filesystem::path log_path = g_reshade_base_path / L"ReShade.log";
+	std::filesystem::path log_path = global_config().path();
+	log_path.replace_extension(L".log");
 
 	const bool filter_changed = imgui::search_input_box(_log_filter, sizeof(_log_filter), -(16.0f * _font_size + 2 * _imgui_context->Style.ItemSpacing.x));
 
 	ImGui::SameLine();
 
-	imgui::toggle_button("Word Wrap", _log_wordwrap, 8.0f * _font_size);
+	imgui::toggle_button(_("Word Wrap"), _log_wordwrap, 8.0f * _font_size);
 
 	ImGui::SameLine();
 
-	if (ImGui::Button("Clear Log", ImVec2(8.0f * _font_size, 0.0f)))
+	if (ImGui::Button(_("Clear Log"), ImVec2(8.0f * _font_size, 0.0f)))
 		// Close and open the stream again, which will clear the file too
 		log::open_log_file(log_path, ec);
 
 	ImGui::Spacing();
 
-	if (ImGui::BeginChild("log", ImVec2(0, 0), true, _log_wordwrap ? 0 : ImGuiWindowFlags_AlwaysHorizontalScrollbar))
+	if (ImGui::BeginChild("##log", ImVec2(0, -(ImGui::GetFrameHeightWithSpacing() + _imgui_context->Style.ItemSpacing.y)), ImGuiChildFlags_Border, _log_wordwrap ? 0 : ImGuiWindowFlags_AlwaysHorizontalScrollbar))
 	{
-		// Limit number of log lines to read, to avoid stalling when log gets too big
-		constexpr size_t LINE_LIMIT = 1000;
-
 		const uintmax_t file_size = std::filesystem::file_size(log_path, ec);
 		if (filter_changed || _last_log_size != file_size)
 		{
 			_log_lines.clear();
-			std::ifstream log_file(log_path);
-			for (std::string line; std::getline(log_file, line) && _log_lines.size() < LINE_LIMIT;)
-				if (filter_text(line, _log_filter))
-					_log_lines.push_back(line);
-			_last_log_size = file_size;
 
-			if (_log_lines.size() == LINE_LIMIT)
-				_log_lines.push_back("Log was truncated to reduce memory footprint!");
+			if (FILE *const file = _wfsopen(log_path.c_str(), L"r", SH_DENYNO))
+			{
+				char line_data[2048];
+				while (fgets(line_data, sizeof(line_data), file))
+					if (filter_text(line_data, _log_filter))
+						_log_lines.push_back(line_data);
+
+				fclose(file);
+			}
+
+			_last_log_size = file_size;
 		}
 
 		ImGuiListClipper clipper;
@@ -2396,37 +3076,42 @@ void reshade::runtime::draw_gui_log()
 
 				if (_log_lines[i].find("ERROR |") != std::string::npos || _log_lines[i].find("error") != std::string::npos)
 					textcol = COLOR_RED;
-				else if (_log_lines[i].find("WARN  |") != std::string::npos || _log_lines[i].find("warning") != std::string::npos || i == LINE_LIMIT)
+				else if (_log_lines[i].find("WARN  |") != std::string::npos || _log_lines[i].find("warning") != std::string::npos)
 					textcol = COLOR_YELLOW;
 				else if (_log_lines[i].find("DEBUG |") != std::string::npos)
 					textcol = ImColor(100, 100, 255);
 
+				if (_log_wordwrap)
+					ImGui::PushTextWrapPos();
 				ImGui::PushStyleColor(ImGuiCol_Text, textcol);
-				if (_log_wordwrap) ImGui::PushTextWrapPos();
-
-				ImGui::TextUnformatted(_log_lines[i].c_str());
-
-				if (_log_wordwrap) ImGui::PopTextWrapPos();
+				ImGui::TextUnformatted(_log_lines[i].c_str(), _log_lines[i].c_str() + _log_lines[i].size());
 				ImGui::PopStyleColor();
+				if (_log_wordwrap)
+					ImGui::PopTextWrapPos();
 			}
 		}
 	}
 	ImGui::EndChild();
+
+	ImGui::Spacing();
+
+	if (ImGui::Button((ICON_FK_FOLDER " " + std::string(_("Open folder in explorer"))).c_str(), ImVec2(-1, 0)))
+		utils::open_explorer(log_path);
 }
 void reshade::runtime::draw_gui_about()
 {
 	ImGui::TextUnformatted("ReShade " VERSION_STRING_PRODUCT);
 
-	ImGui::SameLine((ImGui::GetWindowContentRegionMax().x - ImGui::GetWindowContentRegionMin().x) - 7.3f * _font_size);
-	if (ImGui::SmallButton(" Open website "))
+	ImGui::SameLine(ImGui::GetContentRegionAvail().x - ImGui::CalcTextSize(_(" Open website ")).x);
+	if (ImGui::SmallButton(_(" Open website ")))
 		utils::execute_command("https://reshade.me");
 
 	ImGui::Separator();
 
 	ImGui::PushTextWrapPos();
 
-	ImGui::TextUnformatted("Developed and maintained by crosire.");
-	ImGui::TextUnformatted("This project makes use of several open source libraries, licenses of which are listed below:");
+	ImGui::TextUnformatted(_("Developed and maintained by crosire."));
+	ImGui::TextUnformatted(_("This project makes use of several open source libraries, licenses of which are listed below:"));
 
 	if (ImGui::CollapsingHeader("ReShade", ImGuiTreeNodeFlags_DefaultOpen))
 	{
@@ -2445,13 +3130,13 @@ void reshade::runtime::draw_gui_about()
 	}
 	if (ImGui::CollapsingHeader("ImGuiColorTextEdit"))
 	{
-		ImGui::TextUnformatted(R"(Copyright (C) 2017 BalazsJako
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.)");
+		ImGui::TextUnformatted("Copyright (C) 2017 BalazsJako\
+\
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the \"Software\"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:\
+\
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.\
+\
+THE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.");
 	}
 	if (ImGui::CollapsingHeader("gl3w"))
 	{
@@ -2491,21 +3176,31 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 		const resources::data_resource resource = resources::load_data_resource(IDR_LICENSE_VMA);
 		ImGui::TextUnformatted(static_cast<const char *>(resource.data), static_cast<const char *>(resource.data) + resource.data_size);
 	}
+	if (ImGui::CollapsingHeader("OpenVR"))
+	{
+		const resources::data_resource resource = resources::load_data_resource(IDR_LICENSE_OPENVR);
+		ImGui::TextUnformatted(static_cast<const char *>(resource.data), static_cast<const char *>(resource.data) + resource.data_size);
+	}
+	if (ImGui::CollapsingHeader("OpenXR"))
+	{
+		const resources::data_resource resource = resources::load_data_resource(IDR_LICENSE_OPENXR);
+		ImGui::TextUnformatted(static_cast<const char *>(resource.data), static_cast<const char *>(resource.data) + resource.data_size);
+	}
 	if (ImGui::CollapsingHeader("Solarized"))
 	{
-		ImGui::TextUnformatted(R"(Copyright (C) 2011 Ethan Schoonover
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.)");
+		ImGui::TextUnformatted("Copyright (C) 2011 Ethan Schoonover\
+\
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the \"Software\"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:\
+\
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.\
+\
+THE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.");
 	}
 	if (ImGui::CollapsingHeader("Fork Awesome"))
 	{
-		ImGui::TextUnformatted(R"(Copyright (C) 2018 Fork Awesome (https://forkawesome.github.io)
-
-This Font Software is licensed under the SIL Open Font License, Version 1.1. (http://scripts.sil.org/OFL))");
+		ImGui::TextUnformatted("Copyright (C) 2018 Fork Awesome (https://forkawesome.github.io)\
+\
+This Font Software is licensed under the SIL Open Font License, Version 1.1. (http://scripts.sil.org/OFL)");
 	}
 
 	ImGui::PopTextWrapPos();
@@ -2515,21 +3210,23 @@ void reshade::runtime::draw_gui_addons()
 {
 	ini_file &config = global_config();
 
-#  if RESHADE_ADDON_LITE
+#if RESHADE_ADDON == 1
 	if (!addon_enabled)
 	{
-		ImGui::TextColored(COLOR_YELLOW, "High network activity discovered.\nAll add-ons are disabled to prevent exploitation.");
+		ImGui::PushTextWrapPos();
+		ImGui::TextColored(COLOR_YELLOW, _("High network activity discovered.\nAll add-ons are disabled to prevent exploitation."));
+		ImGui::PopTextWrapPos();
 		return;
 	}
 
 	ImGui::AlignTextToFramePadding();
-	ImGui::TextUnformatted("This build of ReShade has only limited add-on functionality.");
-#  else
-	std::filesystem::path addon_search_path = g_reshade_base_path;
+	ImGui::TextUnformatted(_("This build of ReShade has only limited add-on functionality."));
+#else
+	std::filesystem::path addon_search_path = L".\\";
 	config.get("ADDON", "AddonPath", addon_search_path);
-	if (imgui::directory_input_box("Add-on search path", addon_search_path, _file_selection_path))
+	if (imgui::directory_input_box(_("Add-on search path"), addon_search_path, _file_selection_path))
 		config.set("ADDON", "AddonPath", addon_search_path);
-#  endif
+#endif
 
 	ImGui::Spacing();
 	ImGui::Separator();
@@ -2539,123 +3236,139 @@ void reshade::runtime::draw_gui_addons()
 
 	ImGui::Spacing();
 
-	const float bottom_height = ImGui::GetFrameHeightWithSpacing() + _imgui_context->Style.ItemSpacing.y;
-
-	ImGui::BeginChild("##addons", ImVec2(0, -bottom_height), false, ImGuiWindowFlags_NavFlattened);
-
 	if (!addon_all_loaded)
 	{
-		ImGui::TextColored(COLOR_RED, "There were errors loading some add-ons. Check the log for more details.");
+		ImGui::PushTextWrapPos();
+#if RESHADE_ADDON == 1
+		ImGui::TextColored(COLOR_YELLOW, _("Some add-ons were not loaded because this build of ReShade has only limited add-on functionality."));
+#else
+		ImGui::PushStyleColor(ImGuiCol_Text, COLOR_RED);
+		ImGui::TextUnformatted(_("There were errors loading some add-ons."));
+		ImGui::TextUnformatted(_("Check the log for more details."));
+		ImGui::PopStyleColor();
+#endif
+		ImGui::PopTextWrapPos();
 		ImGui::Spacing();
 	}
 
-	std::vector<std::string> disabled_addons;
-	config.get("ADDON", "DisabledAddons", disabled_addons);
-
-	const float child_window_width = ImGui::GetContentRegionAvail().x;
-
-	for (addon_info &info : addon_loaded_info)
+	if (ImGui::BeginChild("##addons", ImVec2(0, -(ImGui::GetFrameHeightWithSpacing() + _imgui_context->Style.ItemSpacing.y)), ImGuiChildFlags_None, ImGuiWindowFlags_NavFlattened))
 	{
-		if (!filter_text(info.name, _addons_filter))
-			continue;
+		std::vector<std::string> disabled_addons;
+		config.get("ADDON", "DisabledAddons", disabled_addons);
 
-		const ImGuiID settings_id = ImGui::GetID(info.name.c_str());
-		float settings_height = ImGui::GetStateStorage()->GetFloat(settings_id);
+		const float child_window_width = ImGui::GetContentRegionAvail().x;
 
-		ImGui::BeginChild(info.name.c_str(), ImVec2(child_window_width, settings_height + _imgui_context->Style.FramePadding.y * 2), true, ImGuiWindowFlags_NoScrollbar);
-
-		const bool builtin = (info.file == g_reshade_dll_path.filename().u8string());
-
-		bool open = ImGui::GetStateStorage()->GetBool(ImGui::GetID("##addon_open"), builtin);
-		if (ImGui::ArrowButton("##addon_open", open ? ImGuiDir_Down : ImGuiDir_Right))
-			ImGui::GetStateStorage()->SetBool(ImGui::GetID("##addon_open"), open = !open);
-
-		ImGui::SameLine();
-
-		ImGui::PushStyleColor(ImGuiCol_Text, _imgui_context->Style.Colors[info.handle != nullptr ? ImGuiCol_Text : ImGuiCol_TextDisabled]);
-
-		const auto disabled_it = std::find_if(disabled_addons.begin(), disabled_addons.end(),
-			[&info](const std::string_view &addon_name) {
-				const size_t at_pos = addon_name.find('@');
-				if (at_pos == std::string::npos)
-					return addon_name == info.name;
-				return addon_name.substr(0, at_pos) == info.name && addon_name.substr(at_pos + 1) == info.file;
-			});
-
-		bool enabled = (disabled_it == disabled_addons.end());
-		if (ImGui::Checkbox(info.name.c_str(), &enabled))
+		for (addon_info &info : addon_loaded_info)
 		{
-			if (enabled)
-				disabled_addons.erase(disabled_it);
-			else
-				disabled_addons.push_back(builtin ? info.name : info.name + '@' + info.file);
+			if (!filter_text(info.name, _addons_filter))
+				continue;
 
-			config.set("ADDON", "DisabledAddons", disabled_addons);
-		}
+			ImGui::BeginChild(info.name.c_str(), ImVec2(child_window_width, 0.0f), ImGuiChildFlags_Border | ImGuiChildFlags_AutoResizeY, ImGuiWindowFlags_NoScrollbar);
 
-		ImGui::PopStyleColor();
+			const bool builtin = (info.file == g_reshade_dll_path.filename().u8string());
 
-		if (enabled == (info.handle == nullptr))
-		{
+			bool open = ImGui::GetStateStorage()->GetBool(ImGui::GetID("##addon_open"), builtin);
+			if (ImGui::ArrowButton("##addon_open", open ? ImGuiDir_Down : ImGuiDir_Right))
+				ImGui::GetStateStorage()->SetBool(ImGui::GetID("##addon_open"), open = !open);
+
 			ImGui::SameLine();
-			ImGui::Text("(will be %s on next application restart)", enabled ? "enabled" : "disabled");
-		}
 
-		if (open)
-		{
-			ImGui::Spacing();
-			ImGui::BeginGroup();
+			ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(info.handle != nullptr ? ImGuiCol_Text : ImGuiCol_TextDisabled));
 
-			if (!builtin)
-				ImGui::Text("File:");
-			if (!info.author.empty())
-				ImGui::Text("Author:");
-			if (!info.version.empty())
-				ImGui::Text("Version:");
-			if (!info.description.empty())
-				ImGui::Text("Description:");
+			const auto disabled_it = std::find_if(disabled_addons.begin(), disabled_addons.end(),
+				[&info](const std::string_view addon_name) {
+					const size_t at_pos = addon_name.find('@');
+					if (at_pos == std::string_view::npos)
+						return addon_name == info.name;
+					return addon_name.substr(0, at_pos) == info.name && addon_name.substr(at_pos + 1) == info.file;
+				});
 
-			ImGui::EndGroup();
-			ImGui::SameLine(ImGui::GetWindowWidth() * 0.25f);
-			ImGui::BeginGroup();
-
-			if (!builtin)
-				ImGui::TextUnformatted(info.file.c_str());
-			if (!info.author.empty())
-				ImGui::TextUnformatted(info.author.c_str());
-			if (!info.version.empty())
-				ImGui::TextUnformatted(info.version.c_str());
-			if (!info.description.empty())
+			bool enabled = (disabled_it == disabled_addons.end());
+			if (ImGui::Checkbox(info.name.c_str(), &enabled))
 			{
-				ImGui::PushTextWrapPos();
-				ImGui::TextUnformatted(info.description.c_str());
-				ImGui::PopTextWrapPos();
+				if (enabled)
+					disabled_addons.erase(disabled_it);
+				else
+					disabled_addons.push_back(builtin ? info.name : info.name + '@' + info.file);
+
+				config.set("ADDON", "DisabledAddons", disabled_addons);
 			}
 
-			ImGui::EndGroup();
+			ImGui::PopStyleColor();
 
-			if (info.settings_overlay_callback != nullptr)
+			if (enabled == (info.handle == nullptr))
+			{
+				ImGui::SameLine();
+				ImGui::TextUnformatted(enabled ? _("(will be enabled on next application restart)") : _("(will be disabled on next application restart)"));
+			}
+
+			if (open)
 			{
 				ImGui::Spacing();
-				ImGui::Separator();
-				ImGui::Spacing();
+				ImGui::BeginGroup();
 
-				info.settings_overlay_callback(this);
+				if (!builtin)
+					ImGui::Text(_("File:"));
+				if (!info.author.empty())
+					ImGui::Text(_("Author:"));
+				if (info.version.value)
+					ImGui::Text(_("Version:"));
+				if (!info.description.empty())
+					ImGui::Text(_("Description:"));
+				if (!info.website_url.empty())
+					ImGui::Text(_("Website:"));
+				if (!info.issues_url.empty())
+					ImGui::Text(_("Issues:"));
+
+				ImGui::EndGroup();
+				ImGui::SameLine(ImGui::GetWindowWidth() * 0.25f);
+				ImGui::BeginGroup();
+
+				if (!builtin)
+					ImGui::TextUnformatted(info.file.c_str(), info.file.c_str() + info.file.size());
+				if (!info.author.empty())
+					ImGui::TextUnformatted(info.author.c_str(), info.author.c_str() + info.author.size());
+				if (info.version.value)
+					ImGui::Text("%u.%u.%u.%u", info.version.number.major, info.version.number.minor, info.version.number.build, info.version.number.revision);
+				if (!info.description.empty())
+				{
+					ImGui::PushTextWrapPos();
+					ImGui::TextUnformatted(info.description.c_str(), info.description.c_str() + info.description.size());
+					ImGui::PopTextWrapPos();
+				}
+				if (!info.website_url.empty())
+				{
+					if (ImGui::TextUnformatted(info.website_url.c_str(), info.website_url.c_str() + info.website_url.size()); ImGui::SameLine(),
+						ImGui::SmallButton(ICON_FK_SEARCH))
+						utils::execute_command(info.website_url);
+				}
+				if (!info.issues_url.empty())
+				{
+					if (ImGui::TextUnformatted(info.issues_url.c_str(), info.issues_url.c_str() + info.issues_url.size()); ImGui::SameLine(),
+						ImGui::SmallButton(ICON_FK_SEARCH))
+						utils::execute_command(info.issues_url);
+				}
+
+				ImGui::EndGroup();
+
+				if (info.settings_overlay_callback != nullptr)
+				{
+					ImGui::Spacing();
+					ImGui::Separator();
+					ImGui::Spacing();
+
+					info.settings_overlay_callback(this);
+				}
 			}
+
+			ImGui::EndChild();
 		}
-
-		settings_height = ImGui::GetCursorPosY();
-
-		ImGui::EndChild();
-
-		ImGui::GetStateStorage()->SetFloat(settings_id, settings_height);
 	}
-
 	ImGui::EndChild();
 
 	ImGui::Spacing();
 
-	if (ImGui::Button("Open developer documentation", ImVec2(-1, 0)))
+	if (ImGui::Button(_("Open developer documentation"), ImVec2(-1, 0)))
 		utils::execute_command("https://reshade.me/docs");
 }
 #endif
@@ -2665,115 +3378,83 @@ void reshade::runtime::draw_variable_editor()
 {
 	const ImVec2 popup_pos = ImGui::GetCursorScreenPos() + ImVec2(std::max(0.f, (ImGui::GetWindowContentRegionMax().x - ImGui::GetWindowContentRegionMin().x) * 0.5f - 200.0f), ImGui::GetFrameHeightWithSpacing());
 
-	if (imgui::popup_button("Edit global preprocessor definitions", ImGui::GetContentRegionAvail().x, ImGuiWindowFlags_NoMove))
+	if (imgui::popup_button(_("Edit global preprocessor definitions"), ImGui::GetContentRegionAvail().x, ImGuiWindowFlags_NoMove))
 	{
 		ImGui::SetWindowPos(popup_pos);
 
-		bool modified = false;
-		float popup_height = (std::max(_global_preprocessor_definitions.size(), _preset_preprocessor_definitions.size()) + 2) * ImGui::GetFrameHeightWithSpacing();
+		bool global_modified = false, preset_modified = false;
+		float popup_height = (std::max(_global_preprocessor_definitions.size(), _preset_preprocessor_definitions[{}].size()) + 2) * ImGui::GetFrameHeightWithSpacing();
 		popup_height = std::min(popup_height, ImGui::GetWindowViewport()->Size.y - popup_pos.y - 20.0f);
 		popup_height = std::max(popup_height, 42.0f); // Ensure window always has a minimum height
 		const float button_size = ImGui::GetFrameHeight();
 		const float button_spacing = _imgui_context->Style.ItemInnerSpacing.x;
 
-		ImGui::BeginChild("##definitions", ImVec2(400.0f, popup_height), false, ImGuiWindowFlags_NoScrollWithMouse);
+		ImGui::BeginChild("##definitions", ImVec2(30.0f * _font_size, popup_height));
 
 		if (ImGui::BeginTabBar("##definition_types", ImGuiTabBarFlags_NoTooltip))
 		{
-			if (ImGui::BeginTabItem("Global"))
+			const float content_region_width = ImGui::GetContentRegionAvail().x;
+
+			struct
 			{
-				const float content_region_width = ImGui::GetContentRegionAvail().x;
+				std::string name;
+				std::vector<std::pair<std::string, std::string>> &definitions;
+				bool &modified;
+			} definition_types[] = {
+				{ _("Global"), _global_preprocessor_definitions, global_modified },
+				{ _("Current Preset"), _preset_preprocessor_definitions[{}], preset_modified },
+			};
 
-				for (size_t i = 0; i < _global_preprocessor_definitions.size(); ++i)
-				{
-					char name[128] = "";
-					char value[128] = "";
-
-					const size_t equals_index = _global_preprocessor_definitions[i].find('=');
-					_global_preprocessor_definitions[i].copy(name, std::min(equals_index, sizeof(name) - 1));
-					if (equals_index != std::string::npos)
-						_global_preprocessor_definitions[i].copy(value, sizeof(value) - 1, equals_index + 1);
-
-					ImGui::PushID(static_cast<int>(i));
-
-					ImGui::SetNextItemWidth(content_region_width * 0.66666666f - (button_spacing));
-					modified |= ImGui::InputText("##name", name, sizeof(name), ImGuiInputTextFlags_CharsNoBlank | ImGuiInputTextFlags_CallbackCharFilter,
-						[](ImGuiInputTextCallbackData *data) -> int { return data->EventChar == '=' || (data->EventChar != '_' && !isalnum(data->EventChar)); }); // Filter out invalid characters
-
-					ImGui::SameLine(0, button_spacing);
-
-					ImGui::SetNextItemWidth(content_region_width * 0.33333333f - (button_spacing + button_size) + 1);
-					modified |= ImGui::InputText("##value", value, sizeof(value));
-
-					ImGui::SameLine(0, button_spacing);
-
-					if (ImGui::Button(ICON_FK_MINUS, ImVec2(button_size, 0)))
-					{
-						modified = true;
-						_global_preprocessor_definitions.erase(_global_preprocessor_definitions.begin() + i--);
-					}
-					else if (modified)
-					{
-						_global_preprocessor_definitions[i] = std::string(name) + '=' + std::string(value);
-					}
-
-					ImGui::PopID();
-				}
-
-				ImGui::Dummy(ImVec2());
-				ImGui::SameLine(0, content_region_width - button_size);
-				if (ImGui::Button(ICON_FK_PLUS, ImVec2(button_size, 0)))
-					_global_preprocessor_definitions.emplace_back();
-
-				ImGui::EndTabItem();
-			}
-
-			if (ImGui::BeginTabItem("Current Preset"))
+			for (const auto &type : definition_types)
 			{
-				const float content_region_width = ImGui::GetContentRegionAvail().x;
-
-				for (size_t i = 0; i < _preset_preprocessor_definitions.size(); ++i)
+				if (ImGui::BeginTabItem(type.name.c_str()))
 				{
-					char name[128] = "";
-					char value[128] = "";
-
-					const size_t equals_index = _preset_preprocessor_definitions[i].find('=');
-					_preset_preprocessor_definitions[i].copy(name, std::min(equals_index, sizeof(name) - 1));
-					if (equals_index != std::string::npos)
-						_preset_preprocessor_definitions[i].copy(value, sizeof(value) - 1, equals_index + 1);
-
-					ImGui::PushID(static_cast<int>(i));
-
-					ImGui::SetNextItemWidth(content_region_width * 0.66666666f - (button_spacing));
-					modified |= ImGui::InputText("##name", name, sizeof(name), ImGuiInputTextFlags_CharsNoBlank | ImGuiInputTextFlags_CallbackCharFilter,
-						[](ImGuiInputTextCallbackData *data) -> int { return data->EventChar == '=' || (data->EventChar != '_' && !isalnum(data->EventChar)); }); // Filter out invalid characters
-
-					ImGui::SameLine(0, button_spacing);
-
-					ImGui::SetNextItemWidth(content_region_width * 0.33333333f - (button_spacing + button_size) + 1);
-					modified |= ImGui::InputText("##value", value, sizeof(value), ImGuiInputTextFlags_AutoSelectAll);
-
-					ImGui::SameLine(0, button_spacing);
-
-					if (ImGui::Button(ICON_FK_MINUS, ImVec2(button_size, 0)))
+					for (auto it = type.definitions.begin(); it != type.definitions.end();)
 					{
-						modified = true;
-						_preset_preprocessor_definitions.erase(_preset_preprocessor_definitions.begin() + i--);
-					}
-					else if (modified)
-					{
-						_preset_preprocessor_definitions[i] = std::string(name) + '=' + std::string(value);
+						char name[128];
+						name[it->first.copy(name, sizeof(name) - 1)] = '\0';
+						char value[256];
+						value[it->second.copy(value, sizeof(value) - 1)] = '\0';
+
+						ImGui::PushID(static_cast<int>(std::distance(type.definitions.begin(), it)));
+
+						ImGui::SetNextItemWidth(content_region_width * 0.66666666f - (button_spacing));
+						type.modified |= ImGui::InputText("##name", name, sizeof(name), ImGuiInputTextFlags_CharsNoBlank | ImGuiInputTextFlags_CallbackCharFilter,
+							[](ImGuiInputTextCallbackData *data) -> int { return data->EventChar == '=' || (data->EventChar != '_' && !isalnum(data->EventChar)); }); // Filter out invalid characters
+
+						ImGui::SameLine(0, button_spacing);
+
+						ImGui::SetNextItemWidth(content_region_width * 0.33333333f - (button_spacing + button_size));
+						type.modified |= ImGui::InputText("##value", value, sizeof(value));
+
+						ImGui::SameLine(0, button_spacing);
+
+						if (imgui::confirm_button(ICON_FK_MINUS, button_size, _("Do you really want to remove the preprocessor definition '%s'?"), name))
+						{
+							type.modified = true;
+							it = type.definitions.erase(it);
+						}
+						else
+						{
+							if (type.modified)
+							{
+								it->first = name;
+								it->second = value;
+							}
+
+							++it;
+						}
+
+						ImGui::PopID();
 					}
 
-					ImGui::PopID();
+					ImGui::Dummy(ImVec2());
+					ImGui::SameLine(0, content_region_width - button_size);
+					if (ImGui::Button(ICON_FK_PLUS, ImVec2(button_size, 0)))
+						type.definitions.emplace_back();
+
+					ImGui::EndTabItem();
 				}
-
-				ImGui::Dummy(ImVec2());
-				ImGui::SameLine(0, content_region_width - button_size);
-				if (ImGui::Button(ICON_FK_PLUS, ImVec2(button_size, 0)))
-					_preset_preprocessor_definitions.emplace_back();
-
-				ImGui::EndTabItem();
 			}
 
 			ImGui::EndTabBar();
@@ -2781,13 +3462,12 @@ void reshade::runtime::draw_variable_editor()
 
 		ImGui::EndChild();
 
-		if (modified)
-		{
+		if (global_modified)
 			save_config();
-			if (_save_present_on_modification)
-				save_current_preset();
+		if (preset_modified)
+			save_current_preset();
+		if (global_modified || preset_modified)
 			_was_preprocessor_popup_edited = true;
-		}
 
 		ImGui::EndPopup();
 	}
@@ -2797,27 +3477,9 @@ void reshade::runtime::draw_variable_editor()
 		_was_preprocessor_popup_edited = false;
 	}
 
-	const auto find_definition_value = [](auto &list, const auto &name, char value[128] = nullptr) {
-		for (auto it = list.begin(); it != list.end(); ++it)
-		{
-			char current_name[128] = "";
-			const size_t equals_index = it->find('=');
-			it->copy(current_name, std::min(equals_index, sizeof(current_name) - 1));
-
-			if (name == current_name)
-			{
-				if (equals_index != std::string::npos && value != nullptr)
-					value[it->copy(value, 127, equals_index + 1)] = '\0';
-				return it;
-			}
-		}
-
-		return list.end();
-	};
-
-	ImGui::BeginChild("##variables", ImVec2(0, 0), false, ImGuiWindowFlags_NavFlattened);
+	ImGui::BeginChild("##variables", ImVec2(0, 0), ImGuiChildFlags_None, ImGuiWindowFlags_NavFlattened);
 	if (_variable_editor_tabs)
-		ImGui::BeginTabBar("##variables");
+		ImGui::BeginTabBar("##variables", ImGuiTabBarFlags_TabListPopupButton | ImGuiTabBarFlags_FittingPolicyScroll);
 
 	for (size_t effect_index = 0, id = 0; effect_index < _effects.size(); ++effect_index)
 	{
@@ -2825,7 +3487,7 @@ void reshade::runtime::draw_variable_editor()
 
 		// Hide variables that are not currently used in any of the active effects
 		// Also skip showing this effect in the variable list if it doesn't have any uniform variables to show
-		if (!effect.rendering || (effect.uniforms.empty() && effect.definitions.empty() && effect.preprocessed))
+		if (!effect.rendering || (effect.uniforms.empty() && effect.definitions.empty()))
 			continue;
 		assert(effect.compiled);
 
@@ -2861,37 +3523,49 @@ void reshade::runtime::draw_variable_editor()
 		}
 
 		ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(_imgui_context->Style.FramePadding.x, 0));
-		if (imgui::popup_button(ICON_FK_UNDO " Reset all to default", _variable_editor_tabs ? ImGui::GetContentRegionAvail().x : ImGui::CalcItemWidth()))
+		if (imgui::confirm_button(
+				(ICON_FK_UNDO " " + std::string(_("Reset all to default"))).c_str(),
+				_variable_editor_tabs ? ImGui::GetContentRegionAvail().x : ImGui::CalcItemWidth(),
+				_("Do you really want to reset all values in '%s' to their defaults?"), effect_name.c_str()))
 		{
-			ImGui::Text("Do you really want to reset all values in '%s' to their defaults?", effect_name.c_str());
+			// Reset all uniform variables
+			for (uniform &variable_it : effect.uniforms)
+				if (variable_it.special == special_uniform::none && !variable_it.annotation_as_uint("noreset"))
+					reset_uniform_value(variable_it);
 
-			if (ImGui::Button("Yes", ImVec2(ImGui::GetContentRegionAvail().x, 0)))
+			// Reset all preprocessor definitions
+			if (const auto preset_it = _preset_preprocessor_definitions.find({});
+				preset_it != _preset_preprocessor_definitions.end() && !preset_it->second.empty())
 			{
-				// Reset all uniform variables
-				for (uniform &variable_it : effect.uniforms)
-					if (variable_it.special == special_uniform::none)
-						reset_uniform_value(variable_it);
-
-				// Reset all preprocessor definitions
 				for (const std::pair<std::string, std::string> &definition : effect.definitions)
-					if (const auto preset_it = find_definition_value(_preset_preprocessor_definitions, definition.first);
-						preset_it != _preset_preprocessor_definitions.end())
-						force_reload_effect = true, // Need to reload after changing preprocessor defines so to get accurate defaults again
-						_preset_preprocessor_definitions.erase(preset_it);
-
-				if (_save_present_on_modification)
-					save_current_preset();
-
-				ImGui::CloseCurrentPopup();
+				{
+					if (const auto it = std::remove_if(preset_it->second.begin(), preset_it->second.end(),
+							[&definition](const std::pair<std::string, std::string> &preset_definition) { return preset_definition.first == definition.first; });
+						it != preset_it->second.end())
+					{
+						preset_it->second.erase(it, preset_it->second.end());
+						force_reload_effect = true; // Need to reload after changing preprocessor defines so to get accurate defaults again
+					}
+				}
 			}
 
-			ImGui::EndPopup();
+			if (const auto preset_it = _preset_preprocessor_definitions.find(effect_name);
+				preset_it != _preset_preprocessor_definitions.end() && !preset_it->second.empty())
+			{
+				_preset_preprocessor_definitions.erase(preset_it);
+				force_reload_effect = true;
+			}
+
+			if (_auto_save_preset)
+				save_current_preset();
+			else
+				_preset_is_modified = true;
 		}
 		ImGui::PopStyleVar();
 
 		bool category_closed = false;
+		bool category_visible = true;
 		std::string current_category;
-		auto modified_definition = _preset_preprocessor_definitions.end();
 
 		size_t active_variable = 0;
 		size_t active_variable_index = std::numeric_limits<size_t>::max();
@@ -2917,154 +3591,238 @@ void reshade::runtime::draw_variable_editor()
 			{
 				current_category = category;
 
-				if (!category.empty())
+				if (!current_category.empty())
 				{
-					std::string category_label(category.data(), category.size());
+					std::string category_label(get_localized_annotation(variable, "ui_category", _current_language));
 					if (!_variable_editor_tabs)
+					{
 						for (float x = 0, space_x = ImGui::CalcTextSize(" ").x, width = (ImGui::CalcItemWidth() - ImGui::CalcTextSize(category_label.data()).x - 45) / 2; x < width; x += space_x)
 							category_label.insert(0, " ");
+						// Ensure widget ID does not change with varying width
+						category_label += "###" + current_category;
+						// Append a unique value so that the context menu does not contain duplicated widgets when a category is made current multiple times
+						category_label += std::to_string(variable_index);
+					}
 
-					ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_NoTreePushOnOpen;
-					if (!variable.annotation_as_int("ui_category_closed"))
-						flags |= ImGuiTreeNodeFlags_DefaultOpen;
+					if (category_visible = true;
+						variable.annotation_as_uint("ui_category_toggle") != 0)
+						get_uniform_value(variable, &category_visible);
 
-					category_closed = !ImGui::TreeNodeEx(category_label.c_str(), flags);
-
-					if (ImGui::BeginPopupContextItem(category_label.c_str()))
+					if (category_visible)
 					{
-						std::string reset_button_label(category.data(), category.size());
-						reset_button_label = ICON_FK_UNDO " Reset all in '" + reset_button_label + "' to default";
+						ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_NoTreePushOnOpen;
+						if (!variable.annotation_as_int("ui_category_closed"))
+							flags |= ImGuiTreeNodeFlags_DefaultOpen;
 
-						if (ImGui::Button(reset_button_label.c_str(), ImVec2(ImGui::GetContentRegionAvail().x, 0)))
+						category_closed = !ImGui::TreeNodeEx(category_label.c_str(), flags);
+
+						if (ImGui::BeginPopupContextItem(category_label.c_str()))
 						{
-							for (uniform &variable_it : effect.uniforms)
-								if (variable_it.special == special_uniform::none &&
-									variable_it.annotation_as_string("ui_category") == category)
-									reset_uniform_value(variable_it);
+							char temp[64];
+							const int temp_size = ImFormatString(temp, sizeof(temp), _("Reset all in '%s' to default"), current_category.c_str());
 
-							if (_save_present_on_modification)
-								save_current_preset();
+							if (imgui::confirm_button(
+									(ICON_FK_UNDO " " + std::string(temp, temp_size)).c_str(),
+									ImGui::GetContentRegionAvail().x,
+									_("Do you really want to reset all values in '%s' to their defaults?"), current_category.c_str()))
+							{
+								for (uniform &variable_it : effect.uniforms)
+									if (variable_it.special == special_uniform::none && !variable_it.annotation_as_uint("noreset") &&
+										variable_it.annotation_as_string("ui_category") == category)
+										reset_uniform_value(variable_it);
 
-							ImGui::CloseCurrentPopup();
+								if (_auto_save_preset)
+									save_current_preset();
+								else
+									_preset_is_modified = true;
+							}
+
+							ImGui::EndPopup();
 						}
-
-						ImGui::EndPopup();
+					}
+					else
+					{
+						category_closed = false;
 					}
 				}
 				else
 				{
 					category_closed = false;
+					category_visible = true;
 				}
 			}
 
 			// Skip rendering invisible items
-			if (category_closed)
+			if (category_closed || (!category_visible && !variable.annotation_as_uint("ui_category_toggle")))
 				continue;
 
-			// Add spacing before variable widget
-			for (int i = 0, spacing = variable.annotation_as_int("ui_spacing"); i < spacing; ++i)
-				ImGui::Spacing();
-
-			// Add user-configurable text before variable widget
-			if (const std::string_view text = variable.annotation_as_string("ui_text");
-				!text.empty())
-			{
-				ImGui::PushTextWrapPos();
-				ImGui::TextUnformatted(text.data());
-				ImGui::PopTextWrapPos();
-			}
-
 			bool modified = false;
-			std::string_view label = variable.annotation_as_string("ui_label");
-			if (label.empty())
-				label = variable.name;
-			const std::string_view ui_type = variable.annotation_as_string("ui_type");
+			bool is_default_value = true;
 
 			ImGui::PushID(static_cast<int>(id++));
 
+			reshadefx::constant value;
 			switch (variable.type.base)
 			{
-				case reshadefx::type::t_bool:
+			case reshadefx::type::t_bool:
+				get_uniform_value(variable, value.as_uint, variable.type.components());
+				for (size_t i = 0; is_default_value && i < variable.type.components(); i++)
+					is_default_value = (value.as_uint[i] != 0) == (variable.initializer_value.as_uint[i] != 0);
+				break;
+			case reshadefx::type::t_int:
+			case reshadefx::type::t_uint:
+				get_uniform_value(variable, value.as_int, variable.type.components());
+				is_default_value = std::memcmp(value.as_int, variable.initializer_value.as_int, variable.type.components() * sizeof(int)) == 0;
+				break;
+			case reshadefx::type::t_float:
+				const float threshold = variable.annotation_as_float("ui_step", 0, 0.001f) * 0.75f + FLT_EPSILON;
+				get_uniform_value(variable, value.as_float, variable.type.components());
+				for (size_t i = 0; is_default_value && i < variable.type.components(); i++)
+					is_default_value = std::abs(value.as_float[i] - variable.initializer_value.as_float[i]) < threshold;
+				break;
+			}
+
+#if RESHADE_ADDON
+			if (invoke_addon_event<addon_event::reshade_overlay_uniform_variable>(this, api::effect_uniform_variable{ reinterpret_cast<uintptr_t>(&variable) }))
+			{
+				reshadefx::constant new_value;
+				switch (variable.type.base)
 				{
-					bool data;
-					get_uniform_value(variable, &data);
-
-					if (ui_type == "combo")
-						modified = imgui::combo_with_buttons(label.data(), data);
-					else
-						modified = ImGui::Checkbox(label.data(), &data);
-
-					if (modified)
-						set_uniform_value(variable, &data);
+				case reshadefx::type::t_bool:
+					get_uniform_value(variable, new_value.as_uint, variable.type.components());
+					for (size_t i = 0; !modified && i < variable.type.components(); i++)
+						modified = (new_value.as_uint[i] != 0) != (value.as_uint[i] != 0);
 					break;
-				}
 				case reshadefx::type::t_int:
 				case reshadefx::type::t_uint:
-				{
-					int data[16];
-					get_uniform_value(variable, data, 16);
-
-					const int ui_min_val = variable.annotation_as_int("ui_min", 0, ui_type == "slider" ? 0 : std::numeric_limits<int>::lowest());
-					const int ui_max_val = variable.annotation_as_int("ui_max", 0, ui_type == "slider" ? 1 : std::numeric_limits<int>::max());
-					const int ui_stp_val = std::max(1, variable.annotation_as_int("ui_step"));
-
-					if (ui_type == "slider")
-						modified = imgui::slider_with_buttons(label.data(), variable.type.is_signed() ? ImGuiDataType_S32 : ImGuiDataType_U32, data, variable.type.rows, &ui_stp_val, &ui_min_val, &ui_max_val);
-					else if (ui_type == "drag")
-						modified = variable.annotation_as_int("ui_step") == 0 ?
-							ImGui::DragScalarN(label.data(), variable.type.is_signed() ? ImGuiDataType_S32 : ImGuiDataType_U32, data, variable.type.rows, 1.0f, &ui_min_val, &ui_max_val) :
-							imgui::drag_with_buttons(label.data(), variable.type.is_signed() ? ImGuiDataType_S32 : ImGuiDataType_U32, data, variable.type.rows, &ui_stp_val, &ui_min_val, &ui_max_val);
-					else if (ui_type == "list")
-						modified = imgui::list_with_buttons(label.data(), variable.annotation_as_string("ui_items"), data[0]);
-					else if (ui_type == "combo")
-						modified = imgui::combo_with_buttons(label.data(), variable.annotation_as_string("ui_items"), data[0]);
-					else if (ui_type == "radio")
-						modified = imgui::radio_list(label.data(), variable.annotation_as_string("ui_items"), data[0]);
-					else if (variable.type.is_matrix())
-						for (unsigned int row = 0; row < variable.type.rows; ++row)
-							modified = ImGui::InputScalarN((std::string(label) + " [row " + std::to_string(row) + ']').c_str(), variable.type.is_signed() ? ImGuiDataType_S32 : ImGuiDataType_U32, &data[0] + row * variable.type.cols, variable.type.cols) || modified;
-					else
-						modified = ImGui::InputScalarN(label.data(), variable.type.is_signed() ? ImGuiDataType_S32 : ImGuiDataType_U32, data, variable.type.rows);
-
-					if (modified)
-						set_uniform_value(variable, data, 16);
+					get_uniform_value(variable, new_value.as_int, variable.type.components());
+					modified = std::memcmp(new_value.as_int, value.as_int, variable.type.components() * sizeof(int)) != 0;
+					break;
+				case reshadefx::type::t_float:
+					get_uniform_value(variable, new_value.as_float, variable.type.components());
+					for (size_t i = 0; !modified && i < variable.type.components(); i++)
+						modified = std::abs(new_value.as_float[i] - value.as_float[i]) > FLT_EPSILON;
 					break;
 				}
-				case reshadefx::type::t_float:
+			}
+			else
+#endif
+			{
+				// Add spacing before variable widget
+				for (int i = 0, spacing = variable.annotation_as_int("ui_spacing"); i < spacing; ++i)
+					ImGui::Spacing();
+
+				// Add user-configurable text before variable widget
+				if (const std::string_view text = get_localized_annotation(variable, "ui_text", _current_language);
+					!text.empty())
 				{
-					float data[16];
-					get_uniform_value(variable, data, 16);
+					ImGui::PushTextWrapPos();
+					ImGui::TextUnformatted(text.data(), text.data() + text.size());
+					ImGui::PopTextWrapPos();
+				}
 
-					const float ui_min_val = variable.annotation_as_float("ui_min", 0, ui_type == "slider" ? 0.0f : std::numeric_limits<float>::lowest());
-					const float ui_max_val = variable.annotation_as_float("ui_max", 0, ui_type == "slider" ? 1.0f : std::numeric_limits<float>::max());
-					const float ui_stp_val = std::max(0.001f, variable.annotation_as_float("ui_step"));
+				ImGui::BeginDisabled(variable.annotation_as_uint("noedit") != 0);
 
-					// Calculate display precision based on step value
-					char precision_format[] = "%.0f";
-					for (float x = 1.0f; x * ui_stp_val < 1.0f && precision_format[2] < '9'; x *= 10.0f)
-						++precision_format[2]; // This changes the text to "%.1f", "%.2f", "%.3f", ...
+				std::string_view label = get_localized_annotation(variable, "ui_label", _current_language);
+				if (label.empty())
+					label = variable.name;
+				const std::string_view ui_type = variable.annotation_as_string("ui_type");
 
-					if (ui_type == "slider")
-						modified = imgui::slider_with_buttons(label.data(), ImGuiDataType_Float, data, variable.type.rows, &ui_stp_val, &ui_min_val, &ui_max_val, precision_format);
-					else if (ui_type == "drag")
-						modified = variable.annotation_as_float("ui_step") == 0 ?
-							ImGui::DragScalarN(label.data(), ImGuiDataType_Float, data, variable.type.rows, ui_stp_val, &ui_min_val, &ui_max_val, precision_format) :
-							imgui::drag_with_buttons(label.data(), ImGuiDataType_Float, data, variable.type.rows, &ui_stp_val, &ui_min_val, &ui_max_val, precision_format);
-					else if (ui_type == "color" && variable.type.rows == 1)
-						modified = imgui::slider_for_alpha_value(label.data(), data);
-					else if (ui_type == "color" && variable.type.rows == 3)
-						modified = ImGui::ColorEdit3(label.data(), data, ImGuiColorEditFlags_NoOptions);
-					else if (ui_type == "color" && variable.type.rows == 4)
-						modified = ImGui::ColorEdit4(label.data(), data, ImGuiColorEditFlags_NoOptions | ImGuiColorEditFlags_AlphaPreview | ImGuiColorEditFlags_AlphaBar);
-					else if (variable.type.is_matrix())
-						for (unsigned int row = 0; row < variable.type.rows; ++row)
-							modified = ImGui::InputScalarN((std::string(label) + " [row " + std::to_string(row) + ']').c_str(), ImGuiDataType_Float, &data[0] + row * variable.type.cols, variable.type.cols) || modified;
-					else
-						modified = ImGui::InputScalarN(label.data(), ImGuiDataType_Float, data, variable.type.rows);
+				switch (variable.type.base)
+				{
+					case reshadefx::type::t_bool:
+					{
+						if (ui_type == "combo")
+							modified = imgui::combo_with_buttons(label.data(), reinterpret_cast<bool *>(&value.as_uint[0]));
+						else
+							modified = imgui::checkbox_list(label.data(), get_localized_annotation(variable, "ui_items", _current_language), value.as_uint, variable.type.components());
 
-					if (modified)
-						set_uniform_value(variable, data, 16);
-					break;
+						if (modified)
+							set_uniform_value(variable, value.as_uint, variable.type.components());
+						break;
+					}
+					case reshadefx::type::t_int:
+					case reshadefx::type::t_uint:
+					{
+						const int ui_min_val = variable.annotation_as_int("ui_min", 0, ui_type == "slider" ? 0 : std::numeric_limits<int>::lowest());
+						const int ui_max_val = variable.annotation_as_int("ui_max", 0, ui_type == "slider" ? 1 : std::numeric_limits<int>::max());
+						const int ui_stp_val = variable.annotation_as_int("ui_step", 0, 1);
+
+						// Append units
+						std::string format = "%d";
+						format += get_localized_annotation(variable, "ui_units", _current_language);
+
+						if (ui_type == "slider")
+							modified = imgui::slider_with_buttons(label.data(), variable.type.is_signed() ? ImGuiDataType_S32 : ImGuiDataType_U32, value.as_int, variable.type.rows, &ui_stp_val, &ui_min_val, &ui_max_val, format.c_str());
+						else if (ui_type == "drag")
+							modified = variable.annotation_as_int("ui_step") == 0 ?
+								ImGui::DragScalarN(label.data(), variable.type.is_signed() ? ImGuiDataType_S32 : ImGuiDataType_U32, value.as_int, variable.type.rows, 1.0f, &ui_min_val, &ui_max_val, format.c_str()) :
+								imgui::drag_with_buttons(label.data(), variable.type.is_signed() ? ImGuiDataType_S32 : ImGuiDataType_U32, value.as_int, variable.type.rows, &ui_stp_val, &ui_min_val, &ui_max_val, format.c_str());
+						else if (ui_type == "list")
+							modified = imgui::list_with_buttons(label.data(), get_localized_annotation(variable, "ui_items", _current_language), &value.as_int[0]);
+						else if (ui_type == "combo")
+							modified = imgui::combo_with_buttons(label.data(), get_localized_annotation(variable, "ui_items", _current_language), &value.as_int[0]);
+						else if (ui_type == "radio")
+							modified = imgui::radio_list(label.data(), get_localized_annotation(variable, "ui_items", _current_language), &value.as_int[0]);
+						else if (variable.type.is_matrix())
+							for (unsigned int row = 0; row < variable.type.rows; ++row)
+								modified |= ImGui::InputScalarN((std::string(label) + " [row " + std::to_string(row) + ']').c_str(), variable.type.is_signed() ? ImGuiDataType_S32 : ImGuiDataType_U32, &value.as_int[variable.type.cols * row], variable.type.cols) || modified;
+						else
+							modified = ImGui::InputScalarN(label.data(), variable.type.is_signed() ? ImGuiDataType_S32 : ImGuiDataType_U32, value.as_int, variable.type.rows);
+
+						if (modified)
+							set_uniform_value(variable, value.as_int, variable.type.components());
+						break;
+					}
+					case reshadefx::type::t_float:
+					{
+						const float ui_min_val = variable.annotation_as_float("ui_min", 0, ui_type == "slider" ? 0.0f : std::numeric_limits<float>::lowest());
+						const float ui_max_val = variable.annotation_as_float("ui_max", 0, ui_type == "slider" ? 1.0f : std::numeric_limits<float>::max());
+						const float ui_stp_val = variable.annotation_as_float("ui_step", 0, 0.001f);
+
+						// Calculate display precision based on step value
+						std::string precision_format = "%.0f";
+						for (float x = 1.0f; x * ui_stp_val < 1.0f && precision_format[2] < '9'; x *= 10.0f)
+							++precision_format[2]; // This changes the text to "%.1f", "%.2f", "%.3f", ...
+
+						// Append units
+						precision_format += get_localized_annotation(variable, "ui_units", _current_language);
+
+						if (ui_type == "slider")
+							modified = imgui::slider_with_buttons(label.data(), ImGuiDataType_Float, value.as_float, variable.type.rows, &ui_stp_val, &ui_min_val, &ui_max_val, precision_format.c_str());
+						else if (ui_type == "drag")
+							modified = variable.annotation_as_float("ui_step") == 0.0f ?
+								ImGui::DragScalarN(label.data(), ImGuiDataType_Float, value.as_float, variable.type.rows, ui_stp_val, &ui_min_val, &ui_max_val, precision_format.c_str()) :
+								imgui::drag_with_buttons(label.data(), ImGuiDataType_Float, value.as_float, variable.type.rows, &ui_stp_val, &ui_min_val, &ui_max_val, precision_format.c_str());
+						else if (ui_type == "color" && variable.type.rows == 1)
+							modified = imgui::slider_for_alpha_value(label.data(), value.as_float);
+						else if (ui_type == "color" && variable.type.rows == 3)
+							modified = ImGui::ColorEdit3(label.data(), value.as_float, ImGuiColorEditFlags_NoOptions);
+						else if (ui_type == "color" && variable.type.rows == 4)
+							modified = ImGui::ColorEdit4(label.data(), value.as_float, ImGuiColorEditFlags_NoOptions | ImGuiColorEditFlags_AlphaPreview | ImGuiColorEditFlags_AlphaBar);
+						else if (variable.type.is_matrix())
+							for (unsigned int row = 0; row < variable.type.rows; ++row)
+								modified |= ImGui::InputScalarN((std::string(label) + " [row " + std::to_string(row) + ']').c_str(), ImGuiDataType_Float, &value.as_float[variable.type.cols * row], variable.type.cols) || modified;
+						else
+							modified = ImGui::InputScalarN(label.data(), ImGuiDataType_Float, value.as_float, variable.type.rows);
+
+						if (modified)
+							set_uniform_value(variable, value.as_float, variable.type.components());
+						break;
+					}
+				}
+
+				ImGui::EndDisabled();
+
+				// Display tooltip
+				if (const std::string_view tooltip = get_localized_annotation(variable, "ui_tooltip", _current_language);
+					!tooltip.empty() && ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip | ImGuiHoveredFlags_AllowWhenDisabled))
+				{
+					if (ImGui::BeginTooltip())
+					{
+						ImGui::TextUnformatted(tooltip.data(), tooltip.data() + tooltip.size());
+						ImGui::EndTooltip();
+					}
 				}
 			}
 
@@ -3073,21 +3831,16 @@ void reshade::runtime::draw_variable_editor()
 			if (ImGui::IsItemHovered())
 				hovered_variable = variable_index + 1;
 
-			// Display tooltip
-			if (const std::string_view tooltip = variable.annotation_as_string("ui_tooltip");
-				!tooltip.empty() && ImGui::IsItemHovered())
-				ImGui::SetTooltip("%s", tooltip.data());
-
 			// Create context menu
 			if (ImGui::BeginPopupContextItem("##context"))
 			{
-				ImGui::SetNextItemWidth(230.0f);
+				ImGui::SetNextItemWidth(18.0f * _font_size);
 				if (variable.supports_toggle_key() &&
 					_input != nullptr &&
 					imgui::key_input_box("##toggle_key", variable.toggle_key_data, *_input))
 					modified = true;
 
-				if (ImGui::Button(ICON_FK_UNDO " Reset to default", ImVec2(230.0f, 0)))
+				if (ImGui::Button((ICON_FK_UNDO " " + std::string(_("Reset to default"))).c_str(), ImVec2(18.0f * _font_size, 0)))
 				{
 					modified = true;
 					reset_uniform_value(variable);
@@ -3095,6 +3848,16 @@ void reshade::runtime::draw_variable_editor()
 				}
 
 				ImGui::EndPopup();
+			}
+
+			if (!is_default_value && !variable.annotation_as_uint("noreset"))
+			{
+				ImGui::SameLine();
+				if (ImGui::SmallButton(ICON_FK_UNDO))
+				{
+					modified = true;
+					reset_uniform_value(variable);
+				}
 			}
 
 			if (variable.toggle_key_data[0] != 0)
@@ -3106,8 +3869,13 @@ void reshade::runtime::draw_variable_editor()
 			ImGui::PopID();
 
 			// A value has changed, so save the current preset
-			if (modified && _save_present_on_modification)
-				save_current_preset();
+			if (modified && !variable.annotation_as_uint("nosave"))
+			{
+				if (_auto_save_preset)
+					save_current_preset();
+				else
+					_preset_is_modified = true;
+			}
 		}
 
 		if (active_variable_index < effect.uniforms.size())
@@ -3116,75 +3884,86 @@ void reshade::runtime::draw_variable_editor()
 			set_uniform_value(effect.uniforms[hovered_variable_index], static_cast<uint32_t>(hovered_variable));
 
 		// Draw preprocessor definition list after all uniforms of an effect file
-		if (!effect.definitions.empty() || !effect.preprocessed)
+		std::vector<std::pair<std::string, std::string>> &effect_definitions = _preset_preprocessor_definitions[effect_name];
+		std::vector<std::pair<std::string, std::string>>::iterator modified_definition;
+
+		if (!effect.definitions.empty())
 		{
-			std::string category_label = "Preprocessor definitions";
+			std::string category_label = _("Preprocessor definitions");
 			if (!_variable_editor_tabs)
+			{
 				for (float x = 0, space_x = ImGui::CalcTextSize(" ").x, width = (ImGui::CalcItemWidth() - ImGui::CalcTextSize(category_label.c_str()).x - 45) / 2; x < width; x += space_x)
 					category_label.insert(0, " ");
+				category_label += "###ppdefinitions";
+			}
 
-			ImGuiTreeNodeFlags tree_flags = ImGuiTreeNodeFlags_NoTreePushOnOpen;
-			if (effect.preprocessed) // Do not open tree by default is not yet pre-processed, since that would case an immediate recompile
-				tree_flags |= ImGuiTreeNodeFlags_DefaultOpen;
-
-			if (ImGui::TreeNodeEx(category_label.c_str(), tree_flags))
+			if (ImGui::TreeNodeEx(category_label.c_str(), ImGuiTreeNodeFlags_NoTreePushOnOpen | ImGuiTreeNodeFlags_DefaultOpen))
 			{
-				if (!effect.preprocessed)
-					force_reload_effect = true;
-
 				for (const std::pair<std::string, std::string> &definition : effect.definitions)
 				{
-					char value[128] = "";
-					const auto global_it = find_definition_value(_global_preprocessor_definitions, definition.first, value);
-					const auto preset_it = find_definition_value(_preset_preprocessor_definitions, definition.first, value);
+					std::vector<std::pair<std::string, std::string>> *definition_scope = nullptr;
+					std::vector<std::pair<std::string, std::string>>::iterator definition_it;
 
-					if (global_it == _global_preprocessor_definitions.end() &&
-						preset_it == _preset_preprocessor_definitions.end())
-						definition.second.copy(value, sizeof(value) - 1); // Fill with default value
+					char value[256];
+					if (get_preprocessor_definition(effect_name, definition.first, 0b111, definition_scope, definition_it))
+						value[definition_it->second.copy(value, sizeof(value) - 1)] = '\0';
+					else
+						value[0] = '\0';
 
-					if (ImGui::InputText(definition.first.c_str(), value, sizeof(value),
-						global_it != _global_preprocessor_definitions.end() ? ImGuiInputTextFlags_ReadOnly : ImGuiInputTextFlags_AutoSelectAll | ImGuiInputTextFlags_EnterReturnsTrue))
+					if (ImGui::InputTextWithHint(definition.first.c_str(), definition.second.c_str(), value, sizeof(value), ImGuiInputTextFlags_AutoSelectAll | ImGuiInputTextFlags_EnterReturnsTrue))
 					{
 						if (value[0] == '\0') // An empty value removes the definition
 						{
-							if (preset_it != _preset_preprocessor_definitions.end())
+							if (definition_scope == &effect_definitions)
 							{
 								force_reload_effect = true;
-								_preset_preprocessor_definitions.erase(preset_it);
+								definition_scope->erase(definition_it);
 							}
 						}
 						else
 						{
 							force_reload_effect = true;
 
-							if (preset_it != _preset_preprocessor_definitions.end())
+							if (definition_scope == &effect_definitions)
 							{
-								*preset_it = definition.first + '=' + value;
-								modified_definition = preset_it;
+								definition_it->second = value;
+								modified_definition = definition_it;
 							}
 							else
 							{
-								_preset_preprocessor_definitions.push_back(definition.first + '=' + value);
-								modified_definition = _preset_preprocessor_definitions.end() - 1;
+								effect_definitions.emplace_back(definition.first, value);
+								modified_definition = effect_definitions.end() - 1;
 							}
 						}
 					}
 
-					if (!force_reload_effect && // Cannot compare iterators if definitions were just modified above
-						ImGui::BeginPopupContextItem())
+					if (force_reload_effect) // Cannot compare iterators if definitions were just modified above
+						continue;
+
+					if (ImGui::BeginPopupContextItem())
 					{
-						if (ImGui::Button(ICON_FK_UNDO " Reset to default", ImVec2(230.0f, 0)))
+						if (ImGui::Button((ICON_FK_UNDO " " + std::string(_("Reset to default"))).c_str(), ImVec2(18.0f * _font_size, 0)))
 						{
-							if (preset_it != _preset_preprocessor_definitions.end())
+							if (definition_scope != nullptr)
 							{
 								force_reload_effect = true;
-								_preset_preprocessor_definitions.erase(preset_it);
+								definition_scope->erase(definition_it);
 							}
 
 							ImGui::CloseCurrentPopup();
 						}
 
 						ImGui::EndPopup();
+					}
+
+					if (definition_scope == &effect_definitions)
+					{
+						ImGui::SameLine();
+						if (ImGui::SmallButton(ICON_FK_UNDO))
+						{
+							force_reload_effect = true;
+							definition_scope->erase(definition_it);
+						}
 					}
 				}
 			}
@@ -3204,35 +3983,36 @@ void reshade::runtime::draw_variable_editor()
 		{
 			save_current_preset();
 
-			const bool reload_successful_before = _last_reload_successfull;
+			_preset_is_modified = false;
+
+			const bool reload_successful_before = _last_reload_successful;
 
 			// Reload current effect file
-			if (!reload_effect(effect_index) &&
-				modified_definition != _preset_preprocessor_definitions.end())
+			if (!reload_effect(effect_index) && modified_definition != std::vector<std::pair<std::string, std::string>>::iterator())
 			{
 				// The preprocessor definition that was just modified caused the effect to not compile, so reset to default and try again
-				_preset_preprocessor_definitions.erase(modified_definition);
+				effect_definitions.erase(modified_definition);
 
 				if (reload_effect(effect_index))
 				{
-					_last_reload_successfull = reload_successful_before;
+					_last_reload_successful = reload_successful_before;
 					ImGui::OpenPopup("##pperror"); // Notify the user about this
 
 					// Update preset again now, so that the removed preprocessor definition does not reappear on a reload
-					// The preset is actually loaded again next frame to update the technique status (see 'update_and_render_effects'), so cannot use 'save_current_preset' here
-					ini_file::load_cache(_current_preset_path).set({}, "PreprocessorDefinitions", _preset_preprocessor_definitions);
+					// The preset is actually loaded again next frame to update the technique status (see 'update_effects'), so cannot use 'save_current_preset' here
+					ini_file::load_cache(_current_preset_path).set(effect_name, "PreprocessorDefinitions", effect_definitions);
 				}
 			}
 
 			// Reloading an effect file invalidates all textures, but the statistics window may already have drawn references to those, so need to reset it
-			if (ImGuiWindow *const statistics_window = ImGui::FindWindowByName("Statistics"))
+			if (ImGuiWindow *const statistics_window = ImGui::FindWindowByName("###statistics"))
 				statistics_window->DrawList->CmdBuffer.clear();
 		}
 	}
 
 	if (ImGui::BeginPopup("##pperror"))
 	{
-		ImGui::TextColored(COLOR_RED, "The effect failed to compile after this change, so reverted back to the default value.");
+		ImGui::TextColored(COLOR_RED, _("The effect failed to compile after this change, so reverted back to the default value."));
 		ImGui::EndPopup();
 	}
 
@@ -3242,7 +4022,19 @@ void reshade::runtime::draw_variable_editor()
 }
 void reshade::runtime::draw_technique_editor()
 {
-	if (!_last_reload_successfull)
+	if (_reload_count != 0 && _effects.empty())
+	{
+		ImGui::PushStyleColor(ImGuiCol_Text, COLOR_YELLOW);
+		ImGui::TextWrapped(_("No effect files (.fx) found in the configured effect search paths%c"), _effect_search_paths.empty() ? '.' : ':');
+		for (const std::filesystem::path &search_path : _effect_search_paths)
+			ImGui::Text("  %s", (g_reshade_base_path / search_path).lexically_normal().u8string().c_str());
+		ImGui::Spacing();
+		ImGui::TextWrapped(_("Go to the settings and configure the 'Effect search paths' option to point to the directory containing effect files, then hit 'Reload'!"));
+		ImGui::PopStyleColor();
+		return;
+	}
+
+	if (!_last_reload_successful)
 	{
 		// Add fake items at the top for effects that failed to compile
 		for (size_t effect_index = 0; effect_index < _effects.size(); ++effect_index)
@@ -3252,23 +4044,27 @@ void reshade::runtime::draw_technique_editor()
 			if (effect.compiled || effect.skipped)
 				continue;
 
-			ImGui::PushID(static_cast<int>(_techniques.size() + effect_index));
+			ImGui::PushID(static_cast<int>(_technique_sorting.size() + effect_index));
 
 			ImGui::PushStyleColor(ImGuiCol_Text, COLOR_RED);
 			ImGui::PushItemFlag(ImGuiItemFlags_Disabled, true);
 
-			const std::string label = '[' + effect.source_file.filename().u8string() + ']' + " failed to compile";
+			char label[128] = "";
+			ImFormatString(label, sizeof(label), _("[%s] failed to compile"), effect.source_file.filename().u8string().c_str());
+
 			bool value = false;
-			ImGui::Checkbox(label.c_str(), &value);
+			ImGui::Checkbox(label, &value);
 
 			ImGui::PopItemFlag();
 
 			// Display tooltip
-			if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled) && !effect.errors.empty())
+			if (!effect.errors.empty() && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled | ImGuiHoveredFlags_ForTooltip))
 			{
-				ImGui::BeginTooltip();
-				ImGui::TextUnformatted(effect.errors.c_str());
-				ImGui::EndTooltip();
+				if (ImGui::BeginTooltip())
+				{
+					ImGui::TextUnformatted(effect.errors.c_str(), effect.errors.c_str() + effect.errors.size());
+					ImGui::EndTooltip();
+				}
 			}
 
 			ImGui::PopStyleColor();
@@ -3279,17 +4075,17 @@ void reshade::runtime::draw_technique_editor()
 
 			if (ImGui::BeginPopup("##context"))
 			{
-				if (ImGui::Button("Open folder in explorer", ImVec2(230.0f, 0)))
+				if (ImGui::Button((ICON_FK_FOLDER " " + std::string(_("Open folder in explorer"))).c_str(), ImVec2(18.0f * _font_size, 0)))
 					utils::open_explorer(effect.source_file);
 
 				ImGui::Separator();
 
-				if (imgui::popup_button(ICON_FK_PENCIL " Edit source code", 230.0f))
+				if (imgui::popup_button((ICON_FK_PENCIL " " + std::string(_("Edit source code"))).c_str(), 18.0f * _font_size))
 				{
-					std::unordered_map<std::string, std::string> file_errors_lookup;
+					std::unordered_map<std::string_view, std::string> file_errors_lookup;
 					parse_errors(effect.errors,
-						[&file_errors_lookup](const std::string &file, int line, const std::string &message) {
-							file_errors_lookup[file] += file + '(' + std::to_string(line) + "): " + message + '\n';
+						[&file_errors_lookup](const std::string_view file, int line, const std::string_view message) {
+							file_errors_lookup[file] += std::string(file) + '(' + std::to_string(line) + "): " + std::string(message) + '\n';
 						});
 
 					const auto source_file_errors_it = file_errors_lookup.find(effect.source_file.u8string());
@@ -3302,11 +4098,13 @@ void reshade::runtime::draw_technique_editor()
 
 					if (source_file_errors_it != file_errors_lookup.end())
 					{
-						if (ImGui::IsItemHovered())
+						if (ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip))
 						{
-							ImGui::BeginTooltip();
-							ImGui::TextUnformatted(source_file_errors_it->second.c_str());
-							ImGui::EndTooltip();
+							if (ImGui::BeginTooltip())
+							{
+								ImGui::TextUnformatted(source_file_errors_it->second.c_str(), source_file_errors_it->second.c_str() + source_file_errors_it->second.size());
+								ImGui::EndTooltip();
+							}
 						}
 
 						ImGui::PopStyleColor();
@@ -3331,11 +4129,13 @@ void reshade::runtime::draw_technique_editor()
 
 							if (included_file_errors_it != file_errors_lookup.end())
 							{
-								if (ImGui::IsItemHovered())
+								if (ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip))
 								{
-									ImGui::BeginTooltip();
-									ImGui::TextUnformatted(included_file_errors_it->second.c_str());
-									ImGui::EndTooltip();
+									if (ImGui::BeginTooltip())
+									{
+										ImGui::TextUnformatted(included_file_errors_it->second.c_str(), included_file_errors_it->second.c_str() + included_file_errors_it->second.size());
+										ImGui::EndTooltip();
+									}
 								}
 
 								ImGui::PopStyleColor();
@@ -3352,18 +4152,16 @@ void reshade::runtime::draw_technique_editor()
 					}
 				}
 
-				if (!effect.module.hlsl.empty() && // Hide if using SPIR-V, since that cannot easily be shown here
-					imgui::popup_button("Show compiled results", 230.0f))
+				if (!effect.generated_code.empty() &&
+					imgui::popup_button(_("Show compiled results"), 18.0f * _font_size))
 				{
-					std::string entry_point_name;
-					if (ImGui::MenuItem("Generated code"))
-						entry_point_name = "Generated code";
+					const bool open_generated_code = ImGui::MenuItem(_("Generated code"));
 
 					ImGui::EndPopup();
 
-					if (!entry_point_name.empty())
+					if (open_generated_code)
 					{
-						open_code_editor(effect_index, entry_point_name);
+						open_code_editor(effect_index, std::string());
 						ImGui::CloseCurrentPopup();
 					}
 				}
@@ -3378,205 +4176,234 @@ void reshade::runtime::draw_technique_editor()
 	size_t force_reload_effect = std::numeric_limits<size_t>::max();
 	size_t hovered_technique_index = std::numeric_limits<size_t>::max();
 
-	for (size_t index = 0; index < _techniques.size(); ++index)
+	for (size_t index = 0; index < _technique_sorting.size(); ++index)
 	{
-		reshade::technique &tech = _techniques[index];
-
-		// Skip hidden techniques
-		if (tech.hidden || !_effects[tech.effect_index].compiled)
-			continue;
-
-		ImGui::PushID(static_cast<int>(index));
-
-		// Look up effect that contains this technique
-		const reshade::effect &effect = _effects[tech.effect_index];
-
-		// Draw border around the item if it is selected
-		const bool draw_border = _selected_technique == index;
-		if (draw_border)
-			ImGui::Separator();
-
-		// Prevent user from disabling the technique when it is set to always be enabled via annotation
-		const bool force_enabled = tech.annotation_as_int("enabled");
-		ImGui::PushItemFlag(ImGuiItemFlags_Disabled, force_enabled);
-
-		// Gray out disabled techniques
-		ImGui::PushStyleColor(ImGuiCol_Text, _imgui_context->Style.Colors[tech.enabled ? ImGuiCol_Text : ImGuiCol_TextDisabled]);
-
-		std::string label(tech.annotation_as_string("ui_label"));
-		if (label.empty())
-			label = tech.name;
-		label += " [" + effect.source_file.filename().u8string() + ']';
-
-		if (bool status = tech.enabled;
-			ImGui::Checkbox(label.c_str(), &status))
+		const size_t technique_index = _technique_sorting[index];
 		{
-			if (status)
-				enable_technique(tech);
-			else
-				disable_technique(tech);
+			reshade::technique &tech = _techniques[technique_index];
 
-			if (_save_present_on_modification)
-				save_current_preset();
-		}
+			// Skip hidden techniques
+			if (tech.hidden || !_effects[tech.effect_index].compiled)
+				continue;
 
-		ImGui::PopStyleColor();
-		ImGui::PopItemFlag();
+			bool modified = false;
 
-		if (ImGui::IsItemActive())
-			_selected_technique = index;
-		if (ImGui::IsItemClicked())
-			_focused_effect = tech.effect_index;
-		if (ImGui::IsItemHovered(ImGuiHoveredFlags_RectOnly | ImGuiHoveredFlags_AllowWhenDisabled))
-			hovered_technique_index = index;
+			ImGui::PushID(static_cast<int>(index));
 
-		// Display tooltip
-		if (const std::string_view tooltip = tech.annotation_as_string("ui_tooltip");
-			ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled) && (!tooltip.empty() || !effect.errors.empty()))
-		{
-			ImGui::BeginTooltip();
-			if (!tooltip.empty())
-			{
-				ImGui::TextUnformatted(tooltip.data());
-				ImGui::Spacing();
-			}
-			if (!effect.errors.empty())
-			{
-				ImGui::PushStyleColor(ImGuiCol_Text, COLOR_YELLOW);
-				ImGui::TextUnformatted(effect.errors.c_str());
-				ImGui::PopStyleColor();
-			}
-			ImGui::EndTooltip();
-		}
+			// Look up effect that contains this technique
+			const reshade::effect &effect = _effects[tech.effect_index];
 
-		// Create context menu
-		if (ImGui::IsMouseReleased(ImGuiMouseButton_Right) && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenBlockedByPopup | ImGuiHoveredFlags_AllowWhenDisabled))
-			ImGui::OpenPopup("##context", ImGuiPopupFlags_MouseButtonRight);
-
-		if (ImGui::BeginPopup("##context"))
-		{
-			ImGui::TextUnformatted(tech.name.c_str());
-			ImGui::Separator();
-
-			ImGui::SetNextItemWidth(230.0f);
-			if (_input != nullptr && !force_enabled)
-			{
-				if (imgui::key_input_box("##toggle_key", tech.toggle_key_data, *_input) && _save_present_on_modification)
-					save_current_preset();
-			}
-
-			const bool is_not_top = index > 0;
-			const bool is_not_bottom = index < _techniques.size() - 1;
-
-			if (is_not_top && ImGui::Button("Move to top", ImVec2(230.0f, 0)))
-			{
-				_techniques.insert(_techniques.begin(), std::move(_techniques[index]));
-				_techniques.erase(_techniques.begin() + 1 + index);
-				if (_save_present_on_modification)
-					save_current_preset();
-				ImGui::CloseCurrentPopup();
-			}
-			if (is_not_bottom && ImGui::Button("Move to bottom", ImVec2(230.0f, 0)))
-			{
-				_techniques.push_back(std::move(_techniques[index]));
-				_techniques.erase(_techniques.begin() + index);
-				if (_save_present_on_modification)
-					save_current_preset();
-				ImGui::CloseCurrentPopup();
-			}
-
-			if (is_not_top || is_not_bottom || (_input != nullptr && !force_enabled))
+			// Draw border around the item if it is selected
+			const bool draw_border = _selected_technique == index;
+			if (draw_border)
 				ImGui::Separator();
 
-			if (ImGui::Button("Open folder in explorer", ImVec2(230.0f, 0)))
-				utils::open_explorer(effect.source_file);
+			// Prevent user from disabling the technique when it is set to always be enabled via annotation
+			const bool force_enabled = tech.annotation_as_int("enabled");
 
-			ImGui::Separator();
-
-			if (imgui::popup_button(ICON_FK_PENCIL " Edit source code", 230.0f))
+#if RESHADE_ADDON
+			if (bool was_enabled = tech.enabled;
+				invoke_addon_event<addon_event::reshade_overlay_technique>(this, api::effect_technique { reinterpret_cast<uintptr_t>(&tech) }))
 			{
-				std::filesystem::path source_file;
-				if (ImGui::MenuItem(effect.source_file.filename().u8string().c_str()))
-					source_file = effect.source_file;
+				modified = tech.enabled != was_enabled;
+			}
+			else
+#endif
+			{
+				ImGui::BeginDisabled(tech.annotation_as_uint("noedit") != 0);
 
-				if (!effect.preprocessed)
+				// Gray out disabled techniques
+				ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(tech.enabled ? ImGuiCol_Text : ImGuiCol_TextDisabled));
+
+				std::string label(get_localized_annotation(tech, "ui_label", _current_language));
+				if (label.empty())
+					label = tech.name;
+				label += " [" + effect.source_file.filename().u8string() + ']';
+
+				if (bool status = tech.enabled;
+					ImGui::Checkbox(label.c_str(), &status) && !force_enabled)
 				{
-					// Force preprocessor to run to update included files
-					force_reload_effect = tech.effect_index;
+					modified = true;
+
+					if (status)
+						enable_technique(tech);
+					else
+						disable_technique(tech);
 				}
-				else if (!effect.included_files.empty())
+
+				ImGui::PopStyleColor();
+
+				ImGui::EndDisabled();
+
+				// Display tooltip
+				if (const std::string_view tooltip = get_localized_annotation(tech, "ui_tooltip", _current_language);
+					!tooltip.empty() && ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip | ImGuiHoveredFlags_AllowWhenDisabled))
 				{
+					if (ImGui::BeginTooltip())
+					{
+						ImGui::TextUnformatted(tooltip.data(), tooltip.data() + tooltip.size());
+						ImGui::EndTooltip();
+					}
+				}
+			}
+
+			if (ImGui::IsItemActive())
+				_selected_technique = index;
+			if (ImGui::IsItemClicked())
+				_focused_effect = tech.effect_index;
+			if (ImGui::IsItemHovered(ImGuiHoveredFlags_RectOnly | ImGuiHoveredFlags_AllowWhenDisabled))
+				hovered_technique_index = index;
+
+			// Create context menu
+			if (ImGui::BeginPopupContextItem("##context"))
+			{
+				ImGui::TextUnformatted(tech.name.c_str(), tech.name.c_str() + tech.name.size());
+				ImGui::Separator();
+
+				ImGui::SetNextItemWidth(18.0f * _font_size);
+				if (_input != nullptr && !force_enabled &&
+					imgui::key_input_box("##toggle_key", tech.toggle_key_data, *_input))
+				{
+					if (_auto_save_preset)
+						save_current_preset();
+					else
+						_preset_is_modified = true;
+				}
+
+				const bool is_not_top = index > 0;
+				const bool is_not_bottom = index < _technique_sorting.size() - 1;
+
+				if (is_not_top && ImGui::Button(_("Move to top"), ImVec2(18.0f * _font_size, 0)))
+				{
+					std::vector<size_t> technique_indices = _technique_sorting;
+					technique_indices.insert(technique_indices.begin(), technique_indices[index]);
+					technique_indices.erase(technique_indices.begin() + 1 + index);
+					reorder_techniques(std::move(technique_indices));
+
+					if (_auto_save_preset)
+						save_current_preset();
+					else
+						_preset_is_modified = true;
+
+					ImGui::CloseCurrentPopup();
+				}
+				if (is_not_bottom && ImGui::Button(_("Move to bottom"), ImVec2(18.0f * _font_size, 0)))
+				{
+					std::vector<size_t> technique_indices = _technique_sorting;
+					technique_indices.push_back(technique_indices[index]);
+					technique_indices.erase(technique_indices.begin() + index);
+					reorder_techniques(std::move(technique_indices));
+
+					if (_auto_save_preset)
+						save_current_preset();
+					else
+						_preset_is_modified = true;
+
+					ImGui::CloseCurrentPopup();
+				}
+
+				if (is_not_top || is_not_bottom || (_input != nullptr && !force_enabled))
 					ImGui::Separator();
 
-					for (const std::filesystem::path &included_file : effect.included_files)
+				if (ImGui::Button((ICON_FK_FOLDER " " + std::string(_("Open folder in explorer"))).c_str(), ImVec2(18.0f * _font_size, 0)))
+					utils::open_explorer(effect.source_file);
+
+				ImGui::Separator();
+
+				if (imgui::popup_button((ICON_FK_PENCIL " " + std::string(_("Edit source code"))).c_str(), 18.0f * _font_size))
+				{
+					std::filesystem::path source_file;
+					if (ImGui::MenuItem(effect.source_file.filename().u8string().c_str()))
+						source_file = effect.source_file;
+
+					if (!effect.preprocessed)
 					{
-						std::filesystem::path display_path = included_file.lexically_relative(effect.source_file.parent_path());
-						if (display_path.empty())
-							display_path = included_file.filename();
-						if (ImGui::MenuItem(display_path.u8string().c_str()))
-							source_file = included_file;
+						// Force preprocessor to run to update included files
+						force_reload_effect = tech.effect_index;
+					}
+					else if (!effect.included_files.empty())
+					{
+						ImGui::Separator();
+
+						for (const std::filesystem::path &included_file : effect.included_files)
+						{
+							std::filesystem::path display_path = included_file.lexically_relative(effect.source_file.parent_path());
+							if (display_path.empty())
+								display_path = included_file.filename();
+							if (ImGui::MenuItem(display_path.u8string().c_str()))
+								source_file = included_file;
+						}
+					}
+
+					ImGui::EndPopup();
+
+					if (!source_file.empty())
+					{
+						open_code_editor(tech.effect_index, source_file);
+						ImGui::CloseCurrentPopup();
+					}
+				}
+
+				if (!effect.generated_code.empty() &&
+					imgui::popup_button(_("Show compiled results"), 18.0f * _font_size))
+				{
+					const bool open_generated_code = ImGui::MenuItem(_("Generated code"));
+
+					ImGui::Separator();
+
+					std::string entry_point_name;
+					for (const std::pair<std::string, reshadefx::shader_type> &entry_point : effect.module.entry_points)
+						if (const auto assembly_it = effect.assembly_text.find(entry_point.first);
+							assembly_it != effect.assembly_text.end() && ImGui::MenuItem(entry_point.first.c_str()))
+							entry_point_name = entry_point.first;
+
+					ImGui::EndPopup();
+
+					if (open_generated_code || !entry_point_name.empty())
+					{
+						open_code_editor(tech.effect_index, entry_point_name);
+						ImGui::CloseCurrentPopup();
 					}
 				}
 
 				ImGui::EndPopup();
-
-				if (!source_file.empty())
-				{
-					open_code_editor(tech.effect_index, source_file);
-					ImGui::CloseCurrentPopup();
-				}
 			}
 
-			if (!effect.module.hlsl.empty() && // Hide if using SPIR-V, since that cannot easily be shown here
-				imgui::popup_button("Show compiled results", 230.0f))
+			if (tech.toggle_key_data[0] != 0)
 			{
-				std::string entry_point_name;
-				if (ImGui::MenuItem("Generated code"))
-					entry_point_name = "Generated code";
+				ImGui::SameLine(ImGui::GetContentRegionAvail().x - 120);
+				ImGui::TextDisabled("%s", input::key_name(tech.toggle_key_data).c_str());
+			}
 
+			if (draw_border)
 				ImGui::Separator();
 
-				for (const reshadefx::entry_point &entry_point : effect.module.entry_points)
-					if (const auto assembly_it = effect.assembly_text.find(entry_point.name);
-						assembly_it != effect.assembly_text.end() && ImGui::MenuItem(entry_point.name.c_str()))
-						entry_point_name = entry_point.name;
+			ImGui::PopID();
 
-				ImGui::EndPopup();
-
-				if (!entry_point_name.empty())
-				{
-					open_code_editor(tech.effect_index, entry_point_name);
-					ImGui::CloseCurrentPopup();
-				}
+			if (modified)
+			{
+				if (_auto_save_preset)
+					save_current_preset();
+				else
+					_preset_is_modified = true;
 			}
-
-			ImGui::EndPopup();
 		}
-
-		if (tech.toggle_key_data[0] != 0)
-		{
-			ImGui::SameLine(ImGui::GetContentRegionAvail().x - 120);
-			ImGui::TextDisabled("%s", input::key_name(tech.toggle_key_data).c_str());
-		}
-
-		if (draw_border)
-			ImGui::Separator();
-
-		ImGui::PopID();
 	}
 
 	// Move the selected technique to the position of the mouse in the list
-	if (_selected_technique < _techniques.size() && ImGui::IsMouseDragging(ImGuiMouseButton_Left))
+	if (_selected_technique < _technique_sorting.size() && ImGui::IsMouseDragging(ImGuiMouseButton_Left))
 	{
-		if (hovered_technique_index < _techniques.size() && hovered_technique_index != _selected_technique)
+		if (hovered_technique_index < _technique_sorting.size() && hovered_technique_index != _selected_technique)
 		{
-			const auto move_technique = [this](size_t from_index, size_t to_index) {
+			std::vector<size_t> technique_indices = _technique_sorting;
+
+			const auto move_technique = [this, &technique_indices](size_t from_index, size_t to_index) {
 				if (to_index < from_index) // Up
 					for (size_t i = from_index; to_index < i; --i)
-						std::swap(_techniques[i - 1], _techniques[i]);
+						std::swap(technique_indices[i - 1], technique_indices[i]);
 				else // Down
 					for (size_t i = from_index; i < to_index; ++i)
-						std::swap(_techniques[i], _techniques[i + 1]);
+						std::swap(technique_indices[i], technique_indices[i + 1]);
 			};
 
 			move_technique(_selected_technique, hovered_technique_index);
@@ -3584,9 +4411,9 @@ void reshade::runtime::draw_technique_editor()
 			// Pressing shift moves all techniques from the same effect file to the new location as well
 			if (_imgui_context->IO.KeyShift)
 			{
-				for (size_t i = hovered_technique_index + 1, offset = 1; i < _techniques.size(); ++i)
+				for (size_t i = hovered_technique_index + 1, offset = 1; i < technique_indices.size(); ++i)
 				{
-					if (_techniques[i].effect_index == _focused_effect)
+					if (_techniques[technique_indices[i]].effect_index == _focused_effect)
 					{
 						if ((i - hovered_technique_index) > offset)
 							move_technique(i, hovered_technique_index + offset);
@@ -3595,7 +4422,7 @@ void reshade::runtime::draw_technique_editor()
 				}
 				for (size_t i = hovered_technique_index - 1, offset = 0; i >= 0 && i != std::numeric_limits<size_t>::max(); --i)
 				{
-					if (_techniques[i].effect_index == _focused_effect)
+					if (_techniques[technique_indices[i]].effect_index == _focused_effect)
 					{
 						offset++;
 						if ((hovered_technique_index - i) > offset)
@@ -3604,10 +4431,13 @@ void reshade::runtime::draw_technique_editor()
 				}
 			}
 
+			reorder_techniques(std::move(technique_indices));
 			_selected_technique = hovered_technique_index;
 
-			if (_save_present_on_modification)
+			if (_auto_save_preset)
 				save_current_preset();
+			else
+				_preset_is_modified = true;
 			return;
 		}
 	}
@@ -3621,7 +4451,7 @@ void reshade::runtime::draw_technique_editor()
 		reload_effect(force_reload_effect);
 
 		// Reloading an effect file invalidates all textures, but the statistics window may already have drawn references to those, so need to reset it
-		if (ImGuiWindow *const statistics_window = ImGui::FindWindowByName("Statistics"))
+		if (ImGuiWindow *const statistics_window = ImGui::FindWindowByName("###statistics"))
 			statistics_window->DrawList->CmdBuffer.clear();
 	}
 }
@@ -3632,46 +4462,52 @@ void reshade::runtime::open_code_editor(size_t effect_index, const std::string &
 
 	const std::filesystem::path &path = _effects[effect_index].source_file;
 
-	auto it = std::find_if(_editors.begin(), _editors.end(),
-		[effect_index, &path, &entry_point](const editor_instance &instance) {
-			return instance.effect_index == effect_index && instance.file_path == path && instance.entry_point_name == entry_point;
-		});
-	if (it == _editors.end())
+	if (const auto it = std::find_if(_editors.begin(), _editors.end(),
+			[effect_index, &path, &entry_point](const editor_instance &instance) {
+				return instance.effect_index == effect_index && instance.file_path == path && instance.generated && instance.entry_point_name == entry_point;
+			});
+		it != _editors.end())
 	{
-		_editors.push_back({ effect_index, path, entry_point });
-		it = std::prev(_editors.end());
+		it->selected = true;
+		open_code_editor(*it);
 	}
-
-	it->selected = true;
-
-	open_code_editor(*it);
+	else
+	{
+		editor_instance instance { effect_index, path, entry_point, true, true };
+		open_code_editor(instance);
+		_editors.push_back(std::move(instance));
+	}
 }
 void reshade::runtime::open_code_editor(size_t effect_index, const std::filesystem::path &path)
 {
 	assert(effect_index < _effects.size());
 
-	auto it = std::find_if(_editors.begin(), _editors.end(),
-		[effect_index, &path](const editor_instance &instance) {
-			return instance.effect_index == effect_index && instance.file_path == path && instance.entry_point_name.empty();
-		});
-	if (it == _editors.end())
+	if (const auto it = std::find_if(_editors.begin(), _editors.end(),
+			[effect_index, &path](const editor_instance &instance) {
+				return instance.effect_index == effect_index && instance.file_path == path && !instance.generated;
+			});
+		it != _editors.end())
 	{
-		_editors.push_back({ effect_index, path });
-		it = std::prev(_editors.end());
+		it->selected = true;
+		open_code_editor(*it);
 	}
-
-	it->selected = true;
-
-	open_code_editor(*it);
+	else
+	{
+		editor_instance instance { effect_index, path, std::string(), true, false };
+		open_code_editor(instance);
+		_editors.push_back(std::move(instance));
+	}
 }
-void reshade::runtime::open_code_editor(editor_instance &instance)
+void reshade::runtime::open_code_editor(editor_instance &instance) const
 {
 	const effect &effect = _effects[instance.effect_index];
 
-	if (!instance.entry_point_name.empty())
+	if (instance.generated)
 	{
-		instance.editor.set_text(instance.entry_point_name == "Generated code" ?
-			effect.module.hlsl : effect.assembly_text.at(instance.entry_point_name));
+		if (instance.entry_point_name.empty())
+			instance.editor.set_text(effect.generated_code);
+		else
+			instance.editor.set_text(effect.assembly_text.at(instance.entry_point_name));
 		instance.editor.set_readonly(true);
 		return; // Errors only apply to the effect source, not generated code
 	}
@@ -3679,9 +4515,18 @@ void reshade::runtime::open_code_editor(editor_instance &instance)
 	// Only update text if there is no undo history (in which case it can be assumed that the text is already up-to-date)
 	if (!instance.editor.is_modified() && !instance.editor.can_undo())
 	{
-		if (auto file = std::ifstream(instance.file_path))
+		if (FILE *const file = _wfsopen(instance.file_path.c_str(), L"rb", SH_DENYWR))
 		{
-			instance.editor.set_text(std::string(std::istreambuf_iterator<char>(file), {}));
+			fseek(file, 0, SEEK_END);
+			const size_t file_size = ftell(file);
+			fseek(file, 0, SEEK_SET);
+
+			std::string text(file_size, '\0');
+			fread(text.data(), 1, file_size, file);
+
+			fclose(file);
+
+			instance.editor.set_text(text);
 			instance.editor.set_readonly(false);
 		}
 	}
@@ -3689,7 +4534,7 @@ void reshade::runtime::open_code_editor(editor_instance &instance)
 	instance.editor.clear_errors();
 
 	parse_errors(effect.errors,
-		[&instance](const std::string_view &file, int line, const std::string &message) {
+		[&instance](const std::string_view file, int line, const std::string_view message) {
 			// Ignore errors that aren't in the current source file
 			if (file != instance.file_path.u8string())
 				return;
@@ -3699,15 +4544,16 @@ void reshade::runtime::open_code_editor(editor_instance &instance)
 }
 void reshade::runtime::draw_code_editor(editor_instance &instance)
 {
-	if (instance.entry_point_name.empty() && (
-		ImGui::Button(ICON_FK_FLOPPY " Save", ImVec2(ImGui::GetContentRegionAvail().x, 0)) || (
-		_input != nullptr && _input->is_key_pressed('S', true, false, false))))
+	if (!instance.generated && (
+			ImGui::Button((ICON_FK_FLOPPY " " + std::string(_("Save"))).c_str(), ImVec2(ImGui::GetContentRegionAvail().x, 0)) || (
+			_input != nullptr && _input->is_key_pressed('S', true, false, false))))
 	{
 		// Write current editor text to file
-		if (auto file = std::ofstream(instance.file_path, std::ios::trunc))
+		if (FILE *const file = _wfsopen(instance.file_path.c_str(), L"wb", SH_DENYWR))
 		{
 			const std::string text = instance.editor.get_text();
-			file.write(text.data(), text.size());
+			fwrite(text.data(), 1, text.size(), file);
+			fclose(file);
 		}
 
 		if (!is_loading() && instance.effect_index < _effects.size())
@@ -3718,12 +4564,12 @@ void reshade::runtime::draw_code_editor(editor_instance &instance)
 			reload_effect(instance.effect_index);
 
 			// Reloading an effect file invalidates all textures, but the statistics window may already have drawn references to those, so need to reset it
-			if (ImGuiWindow *const statistics_window = ImGui::FindWindowByName("Statistics"))
+			if (ImGuiWindow *const statistics_window = ImGui::FindWindowByName("###statistics"))
 				statistics_window->DrawList->CmdBuffer.clear();
 		}
 	}
 
-	instance.editor.render("##editor", _editor_palette, false, _imgui_context->IO.Fonts->Fonts[1]);
+	instance.editor.render("##editor", _editor_palette, false, _imgui_context->IO.Fonts->Fonts[_imgui_context->IO.Fonts->Fonts.Size - 1]);
 
 	// Disable keyboard shortcuts when the window is focused so they don't get triggered while editing text
 	const bool is_focused = ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows);
@@ -3739,19 +4585,23 @@ void reshade::runtime::draw_code_editor(editor_instance &instance)
 
 bool reshade::runtime::init_imgui_resources()
 {
+	// Adjust default font size based on the vertical resolution
+	if (_font_size == 0)
+		_editor_font_size = _font_size = _height >= 2160 ? 26 : _height >= 1440 ? 20 : 13;
+
 	const bool has_combined_sampler_and_view = _device->check_capability(api::device_caps::sampler_with_resource_view);
 
 	if (_imgui_sampler_state == 0)
 	{
 		api::sampler_desc sampler_desc = {};
 		sampler_desc.filter = api::filter_mode::min_mag_mip_linear;
-		sampler_desc.address_u = api::texture_address_mode::wrap;
-		sampler_desc.address_v = api::texture_address_mode::wrap;
-		sampler_desc.address_w = api::texture_address_mode::wrap;
+		sampler_desc.address_u = api::texture_address_mode::clamp;
+		sampler_desc.address_v = api::texture_address_mode::clamp;
+		sampler_desc.address_w = api::texture_address_mode::clamp;
 
 		if (!_device->create_sampler(sampler_desc, &_imgui_sampler_state))
 		{
-			LOG(ERROR) << "Failed to create ImGui sampler object!";
+			log::message(log::level::error, "Failed to create ImGui sampler object!");
 			return false;
 		}
 	}
@@ -3771,11 +4621,22 @@ bool reshade::runtime::init_imgui_resources()
 			layout_params[num_layout_params++] = api::descriptor_range { 0, 0, 0, 1, api::shader_stage::pixel, 1, api::descriptor_type::shader_resource_view }; // t0
 		}
 
-		layout_params[num_layout_params++] = api::constant_range { 0, 0, 0, 16, api::shader_stage::vertex }; // b0
+		uint32_t num_push_constants = 16;
+		reshade::api::shader_stage shader_stage = api::shader_stage::vertex;
+
+		// Add HDR push constants for possible HDR swap chains
+		if (((_renderer_id & 0xB000) == 0xB000 || (_renderer_id & 0xC000) == 0xC000 || (_renderer_id & 0x20000) == 0x20000) &&
+			(_back_buffer_format == reshade::api::format::r10g10b10a2_unorm || _back_buffer_format == reshade::api::format::b10g10r10a2_unorm || _back_buffer_format == reshade::api::format::r16g16b16a16_float))
+		{
+			num_push_constants += 4;
+			shader_stage |= api::shader_stage::pixel;
+		}
+
+		layout_params[num_layout_params++] = api::constant_range { 0, 0, 0, num_push_constants, shader_stage }; // b0
 
 		if (!_device->create_pipeline_layout(num_layout_params, layout_params, &_imgui_pipeline_layout))
 		{
-			LOG(ERROR) << "Failed to create ImGui pipeline layout!";
+			log::message(log::level::error, "Failed to create ImGui pipeline layout!");
 			return false;
 		}
 	}
@@ -3783,56 +4644,25 @@ bool reshade::runtime::init_imgui_resources()
 	if (_imgui_pipeline != 0)
 		return true;
 
-	api::shader_desc vs_desc, ps_desc;
+	const bool is_possibe_hdr_swapchain =
+		((_renderer_id & 0xB000) == 0xB000 || (_renderer_id & 0xC000) == 0xC000 || (_renderer_id & 0x20000) == 0x20000) &&
+		(_back_buffer_format == reshade::api::format::r10g10b10a2_unorm || _back_buffer_format == reshade::api::format::b10g10r10a2_unorm || _back_buffer_format == reshade::api::format::r16g16b16a16_float);
 
-	if ((_renderer_id & 0xF0000) == 0 || _renderer_id >= 0x20000)
-	{
-		const resources::data_resource vs_res = resources::load_data_resource(_renderer_id >= 0x20000 ? IDR_IMGUI_VS_SPIRV : _renderer_id < 0xa000 ? IDR_IMGUI_VS_3_0 : IDR_IMGUI_VS_4_0);
-		vs_desc.code = vs_res.data;
-		vs_desc.code_size = vs_res.data_size;
+	const resources::data_resource vs_res = resources::load_data_resource(
+		_renderer_id >= 0x20000 ? IDR_IMGUI_VS_SPIRV :
+		_renderer_id >= 0x10000 ? IDR_IMGUI_VS_GLSL :
+		_renderer_id >= 0x0a000 ? IDR_IMGUI_VS_4_0 : IDR_IMGUI_VS_3_0);
+	api::shader_desc vs_desc;
+	vs_desc.code = vs_res.data;
+	vs_desc.code_size = vs_res.data_size;
 
-		const resources::data_resource ps_res = resources::load_data_resource(_renderer_id >= 0x20000 ? IDR_IMGUI_PS_SPIRV : _renderer_id < 0xa000 ? IDR_IMGUI_PS_3_0 : IDR_IMGUI_PS_4_0);
-		ps_desc.code = ps_res.data;
-		ps_desc.code_size = ps_res.data_size;
-	}
-	else
-	{
-		assert(_device->get_api() == api::device_api::opengl);
-
-		// These need to be static so that the shader source memory doesn't fall out of scope before pipeline creation below
-		static constexpr char vertex_shader_code[] =
-			"#version 430\n"
-			"layout(binding = 0) uniform Buf { mat4 proj; };\n"
-			"layout(location = 0) in vec2 pos;\n"
-			"layout(location = 1) in vec2 tex;\n"
-			"layout(location = 2) in vec4 col;\n"
-			"out vec4 frag_col;\n"
-			"out vec2 frag_tex;\n"
-			"void main()\n"
-			"{\n"
-			"	frag_col = col;\n"
-			"	frag_tex = tex;\n"
-			"	gl_Position = proj * vec4(pos.xy, 0, 1);\n"
-			"}\n";
-		static constexpr char fragment_shader_code[] =
-			"#version 430\n"
-			"layout(binding = 0) uniform sampler2D s0;\n"
-			"in vec4 frag_col;\n"
-			"in vec2 frag_tex;\n"
-			"out vec4 col;\n"
-			"void main()\n"
-			"{\n"
-			"	col = frag_col * texture(s0, frag_tex.st);\n"
-			"}\n";
-
-		vs_desc.code = vertex_shader_code;
-		vs_desc.code_size = sizeof(vertex_shader_code);
-		vs_desc.entry_point = "main";
-
-		ps_desc.code = fragment_shader_code;
-		ps_desc.code_size = sizeof(fragment_shader_code);
-		ps_desc.entry_point = "main";
-	}
+	const resources::data_resource ps_res = resources::load_data_resource(
+		_renderer_id >= 0x20000 ? (!is_possibe_hdr_swapchain ? IDR_IMGUI_PS_SPIRV : IDR_IMGUI_PS_SPIRV_HDR) :
+		_renderer_id >= 0x10000 ? IDR_IMGUI_PS_GLSL :
+		_renderer_id >= 0x0a000 ? (!is_possibe_hdr_swapchain ? IDR_IMGUI_PS_4_0 : IDR_IMGUI_PS_4_0_HDR) : IDR_IMGUI_PS_3_0);
+	api::shader_desc ps_desc;
+	ps_desc.code = ps_res.data;
+	ps_desc.code_size = ps_res.data_size;
 
 	std::vector<api::pipeline_subobject> subobjects;
 	subobjects.push_back({ api::pipeline_subobject_type::vertex_shader, 1, &vs_desc });
@@ -3843,8 +4673,10 @@ bool reshade::runtime::init_imgui_resources()
 		{ 1, "TEXCOORD", 0, api::format::r32g32_float,   0, offsetof(ImDrawVert, uv ), sizeof(ImDrawVert), 0 },
 		{ 2, "COLOR",    0, api::format::r8g8b8a8_unorm, 0, offsetof(ImDrawVert, col), sizeof(ImDrawVert), 0 }
 	};
-
 	subobjects.push_back({ api::pipeline_subobject_type::input_layout, 3, (void *)input_layout });
+
+	api::primitive_topology topology = api::primitive_topology::triangle_list;
+	subobjects.push_back({ api::pipeline_subobject_type::primitive_topology, 1, &topology });
 
 	api::blend_desc blend_state;
 	blend_state.blend_enable[0] = true;
@@ -3855,54 +4687,49 @@ bool reshade::runtime::init_imgui_resources()
 	blend_state.dest_alpha_blend_factor[0] = api::blend_factor::one_minus_source_alpha;
 	blend_state.alpha_blend_op[0] = api::blend_op::add;
 	blend_state.render_target_write_mask[0] = 0xF;
-
 	subobjects.push_back({ api::pipeline_subobject_type::blend_state, 1, &blend_state });
 
 	api::rasterizer_desc rasterizer_state;
 	rasterizer_state.cull_mode = api::cull_mode::none;
 	rasterizer_state.scissor_enable = true;
-
 	subobjects.push_back({ api::pipeline_subobject_type::rasterizer_state, 1, &rasterizer_state });
 
 	api::depth_stencil_desc depth_stencil_state;
 	depth_stencil_state.depth_enable = false;
 	depth_stencil_state.stencil_enable = false;
-
 	subobjects.push_back({ api::pipeline_subobject_type::depth_stencil_state, 1, &depth_stencil_state });
 
-	subobjects.push_back({ api::pipeline_subobject_type::render_target_formats, 1, &_back_buffer_format });
+	// Always choose non-sRGB format variant, since 'render_imgui_draw_data' is called with the non-sRGB render target (see 'draw_gui')
+	api::format render_target_format = api::format_to_default_typed(_back_buffer_format, 0);
+	subobjects.push_back({ api::pipeline_subobject_type::render_target_formats, 1, &render_target_format });
 
-	if (_device->create_pipeline(_imgui_pipeline_layout, static_cast<uint32_t>(subobjects.size()), subobjects.data(), &_imgui_pipeline))
+	if (!_device->create_pipeline(_imgui_pipeline_layout, static_cast<uint32_t>(subobjects.size()), subobjects.data(), &_imgui_pipeline))
 	{
-		return true;
-	}
-	else
-	{
-		LOG(ERROR) << "Failed to create ImGui pipeline!";
+		log::message(log::level::error, "Failed to create ImGui pipeline!");
 		return false;
 	}
+
+	return true;
 }
 void reshade::runtime::render_imgui_draw_data(api::command_list *cmd_list, ImDrawData *draw_data, api::resource_view rtv)
 {
-#ifndef NDEBUG
-	cmd_list->begin_debug_event("ReShade overlay");
-#endif
-
 	// Need to multi-buffer vertex data so not to modify data below when the previous frame is still in flight
 	const size_t buffer_index = _frame_count % std::size(_imgui_vertices);
 
 	// Create and grow vertex/index buffers if needed
 	if (_imgui_num_indices[buffer_index] < draw_data->TotalIdxCount)
 	{
-		_graphics_queue->wait_idle(); // Be safe and ensure nothing still uses this buffer
-
 		if (_imgui_indices[buffer_index] != 0)
+		{
+			_graphics_queue->wait_idle(); // Be safe and ensure nothing still uses this buffer
+
 			_device->destroy_resource(_imgui_indices[buffer_index]);
+		}
 
 		const int new_size = draw_data->TotalIdxCount + 10000;
 		if (!_device->create_resource(api::resource_desc(new_size * sizeof(ImDrawIdx), api::memory_heap::cpu_to_gpu, api::resource_usage::index_buffer), nullptr, api::resource_usage::cpu_access, &_imgui_indices[buffer_index]))
 		{
-			LOG(ERROR) << "Failed to create ImGui index buffer!";
+			log::message(log::level::error, "Failed to create ImGui index buffer!");
 			return;
 		}
 
@@ -3912,15 +4739,17 @@ void reshade::runtime::render_imgui_draw_data(api::command_list *cmd_list, ImDra
 	}
 	if (_imgui_num_vertices[buffer_index] < draw_data->TotalVtxCount)
 	{
-		_graphics_queue->wait_idle();
-
 		if (_imgui_vertices[buffer_index] != 0)
+		{
+			_graphics_queue->wait_idle();
+
 			_device->destroy_resource(_imgui_vertices[buffer_index]);
+		}
 
 		const int new_size = draw_data->TotalVtxCount + 5000;
 		if (!_device->create_resource(api::resource_desc(new_size * sizeof(ImDrawVert), api::memory_heap::cpu_to_gpu, api::resource_usage::vertex_buffer), nullptr, api::resource_usage::cpu_access, &_imgui_vertices[buffer_index]))
 		{
-			LOG(ERROR) << "Failed to create ImGui vertex buffer!";
+			log::message(log::level::error, "Failed to create ImGui vertex buffer!");
 			return;
 		}
 
@@ -3928,6 +4757,10 @@ void reshade::runtime::render_imgui_draw_data(api::command_list *cmd_list, ImDra
 
 		_imgui_num_vertices[buffer_index] = new_size;
 	}
+
+#ifndef NDEBUG
+	cmd_list->begin_debug_event("ReShade overlay");
+#endif
 
 	if (ImDrawIdx *idx_dst;
 		_device->map_buffer_region(_imgui_indices[buffer_index], 0, UINT64_MAX, api::map_access::write_only, reinterpret_cast<void **>(&idx_dst)))
@@ -3984,7 +4817,26 @@ void reshade::runtime::render_imgui_draw_data(api::command_list *cmd_list, ImDra
 	const bool has_combined_sampler_and_view = _device->check_capability(api::device_caps::sampler_with_resource_view);
 	cmd_list->push_constants(api::shader_stage::vertex, _imgui_pipeline_layout, has_combined_sampler_and_view ? 1 : 2, 0, sizeof(ortho_projection) / 4, ortho_projection);
 	if (!has_combined_sampler_and_view)
-		cmd_list->push_descriptors(api::shader_stage::pixel, _imgui_pipeline_layout, 0, api::descriptor_set_update { {}, 0, 0, 1, api::descriptor_type::sampler, &_imgui_sampler_state });
+		cmd_list->push_descriptors(api::shader_stage::pixel, _imgui_pipeline_layout, 0, api::descriptor_table_update { {}, 0, 0, 1, api::descriptor_type::sampler, &_imgui_sampler_state });
+
+	// Add HDR push constants for possible HDR swap chains
+	if (((_renderer_id & 0xB000) == 0xB000 || (_renderer_id & 0xC000) == 0xC000 || (_renderer_id & 0x20000) == 0x20000) &&
+		(_back_buffer_format == reshade::api::format::r10g10b10a2_unorm || _back_buffer_format == reshade::api::format::b10g10r10a2_unorm || _back_buffer_format == reshade::api::format::r16g16b16a16_float))
+	{
+		const struct {
+			api::format back_buffer_format;
+			api::color_space back_buffer_color_space;
+			float hdr_overlay_brightness;
+			api::color_space hdr_overlay_overwrite_color_space;
+		} hdr_push_constants = {
+			_back_buffer_format,
+			_back_buffer_color_space,
+			_hdr_overlay_brightness,
+			_hdr_overlay_overwrite_color_space
+		};
+
+		cmd_list->push_constants(api::shader_stage::pixel, _imgui_pipeline_layout, has_combined_sampler_and_view ? 1 : 2, sizeof(ortho_projection) / 4, sizeof(hdr_push_constants) / 4, &hdr_push_constants);
+	}
 
 	int vtx_offset = 0, idx_offset = 0;
 	for (int n = 0; n < draw_data->CmdListsCount; ++n)
@@ -4014,11 +4866,11 @@ void reshade::runtime::render_imgui_draw_data(api::command_list *cmd_list, ImDra
 			if (has_combined_sampler_and_view)
 			{
 				api::sampler_with_resource_view sampler_and_view = { _imgui_sampler_state, srv };
-				cmd_list->push_descriptors(api::shader_stage::pixel, _imgui_pipeline_layout, 0, api::descriptor_set_update { {}, 0, 0, 1, api::descriptor_type::sampler_with_resource_view, &sampler_and_view });
+				cmd_list->push_descriptors(api::shader_stage::pixel, _imgui_pipeline_layout, 0, api::descriptor_table_update { {}, 0, 0, 1, api::descriptor_type::sampler_with_resource_view, &sampler_and_view });
 			}
 			else
 			{
-				cmd_list->push_descriptors(api::shader_stage::pixel, _imgui_pipeline_layout, 1, api::descriptor_set_update { {}, 0, 0, 1, api::descriptor_type::shader_resource_view, &srv });
+				cmd_list->push_descriptors(api::shader_stage::pixel, _imgui_pipeline_layout, 1, api::descriptor_table_update { {}, 0, 0, 1, api::descriptor_type::shader_resource_view, &srv });
 			}
 
 			cmd_list->draw_indexed(cmd.ElemCount, 1, cmd.IdxOffset + idx_offset, cmd.VtxOffset + vtx_offset, 0);
@@ -4036,11 +4888,12 @@ void reshade::runtime::render_imgui_draw_data(api::command_list *cmd_list, ImDra
 }
 void reshade::runtime::destroy_imgui_resources()
 {
+	_imgui_context->IO.Fonts->Clear();
+
 	_device->destroy_resource(_font_atlas_tex);
 	_font_atlas_tex = {};
 	_device->destroy_resource_view(_font_atlas_srv);
 	_font_atlas_srv = {};
-	_rebuild_font_atlas = true;
 
 	for (size_t i = 0; i < std::size(_imgui_vertices); ++i)
 	{
@@ -4058,6 +4911,27 @@ void reshade::runtime::destroy_imgui_resources()
 	_imgui_pipeline = {};
 	_device->destroy_pipeline_layout(_imgui_pipeline_layout);
 	_imgui_pipeline_layout = {};
+}
+
+bool reshade::runtime::open_overlay(bool open, api::input_source source)
+{
+#if RESHADE_ADDON
+	if (!_is_in_api_call)
+	{
+		_is_in_api_call = true;
+		const bool skip = invoke_addon_event<addon_event::reshade_open_overlay>(this, open, source);
+		_is_in_api_call = false;
+		if (skip)
+			return false;
+	}
+#endif
+
+	_show_overlay = open;
+
+	if (open)
+		_imgui_context->NavInputSource = static_cast<ImGuiInputSource>(source);
+
+	return true;
 }
 
 #endif

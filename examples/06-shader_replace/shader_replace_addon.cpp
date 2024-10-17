@@ -3,15 +3,16 @@
  * SPDX-License-Identifier: BSD-3-Clause OR MIT
  */
 
-// The subdirectory to load shader binaries from
-#define LOAD_DIR L""
-
 #include <reshade.hpp>
+#include "config.hpp"
 #include "crc32_hash.hpp"
+#include <cstring>
 #include <fstream>
 #include <filesystem>
 
 using namespace reshade::api;
+
+constexpr uint32_t SPIRV_MAGIC = 0x07230203;
 
 static thread_local std::vector<std::vector<uint8_t>> s_data_to_delete;
 
@@ -23,11 +24,10 @@ static bool load_shader_code(device_api device_type, shader_desc &desc, std::vec
 	uint32_t shader_hash = compute_crc32(static_cast<const uint8_t *>(desc.code), desc.code_size);
 
 	const wchar_t *extension = L".cso";
-	if (device_type == device_api::vulkan || (
-		device_type == device_api::opengl && desc.code_size > sizeof(uint32_t) && *static_cast<const uint32_t *>(desc.code) == 0x07230203 /* SPIR-V magic */))
+	if (device_type == device_api::vulkan || (device_type == device_api::opengl && desc.code_size > sizeof(uint32_t) && *static_cast<const uint32_t *>(desc.code) == SPIRV_MAGIC))
 		extension = L".spv"; // Vulkan uses SPIR-V (and sometimes OpenGL does too)
 	else if (device_type == device_api::opengl)
-		extension = L".glsl"; // OpenGL otherwise uses plain text GLSL
+		extension = desc.code_size > 5 && std::strncmp(static_cast<const char *>(desc.code), "!!ARB", 5) == 0 ? L".txt" : L".glsl"; // OpenGL otherwise uses plain text ARB assembly language or GLSL
 
 	// Prepend executable file name to image files
 	wchar_t file_prefix[MAX_PATH] = L"";
@@ -35,7 +35,7 @@ static bool load_shader_code(device_api device_type, shader_desc &desc, std::vec
 
 	std::filesystem::path replace_path = file_prefix;
 	replace_path  = replace_path.parent_path();
-	replace_path /= LOAD_DIR;
+	replace_path /= RESHADE_ADDON_SHADER_LOAD_DIR;
 
 	wchar_t hash_string[11];
 	swprintf_s(hash_string, L"0x%08X", shader_hash);
@@ -77,6 +77,14 @@ static bool on_create_pipeline(device *device, pipeline_layout, uint32_t subobje
 		case pipeline_subobject_type::geometry_shader:
 		case pipeline_subobject_type::pixel_shader:
 		case pipeline_subobject_type::compute_shader:
+		case pipeline_subobject_type::amplification_shader:
+		case pipeline_subobject_type::mesh_shader:
+		case pipeline_subobject_type::raygen_shader:
+		case pipeline_subobject_type::any_hit_shader:
+		case pipeline_subobject_type::closest_hit_shader:
+		case pipeline_subobject_type::miss_shader:
+		case pipeline_subobject_type::intersection_shader:
+		case pipeline_subobject_type::callable_shader:
 			replaced_stages |= load_shader_code(device_type, *static_cast<shader_desc *>(subobjects[i].data), s_data_to_delete);
 			break;
 		}
@@ -92,7 +100,7 @@ static void on_after_create_pipeline(device *, pipeline_layout, uint32_t, const 
 }
 
 extern "C" __declspec(dllexport) const char *NAME = "Shader Replace";
-extern "C" __declspec(dllexport) const char *DESCRIPTION = "Example add-on that replaces shader binaries before they are used by the application with binaries from disk.";
+extern "C" __declspec(dllexport) const char *DESCRIPTION = "Example add-on that replaces shader binaries before they are used by the application with binaries from disk (\"" RESHADE_ADDON_SHADER_LOAD_DIR "\" directory).";
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
 {

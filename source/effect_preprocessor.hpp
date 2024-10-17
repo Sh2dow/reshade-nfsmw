@@ -23,6 +23,7 @@ namespace reshadefx
 		{
 			std::string replacement_list;
 			std::vector<std::string> parameters;
+			bool is_predefined = false;
 			bool is_variadic = false;
 			bool is_function_like = false;
 		};
@@ -52,7 +53,7 @@ namespace reshadefx
 		/// <returns></returns>
 		bool add_macro_definition(const std::string &name, std::string value = "1")
 		{
-			return add_macro_definition(name, macro { std::move(value), {} });
+			return add_macro_definition(name, macro { std::move(value), {}, true });
 		}
 
 		/// <summary>
@@ -141,15 +142,14 @@ namespace reshadefx
 		void expand_macro(const std::string &name, const macro &macro, const std::vector<std::string> &arguments);
 		void create_macro_replacement_list(macro &macro);
 
-		bool _success = true;
 		std::string _output, _errors;
 
-		std::string _current_token_raw_data;
-		reshadefx::token _token;
-		location _output_location;
 		std::vector<input_level> _input_stack;
 		size_t _next_input_index = 0;
 		size_t _current_input_index = 0;
+		reshadefx::token _token;
+		std::string _current_token_raw_data;
+		reshadefx::location _output_location;
 
 		std::vector<if_level> _if_stack;
 

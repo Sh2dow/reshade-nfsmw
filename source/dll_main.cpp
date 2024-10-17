@@ -19,6 +19,7 @@ static PVOID s_exception_handler_handle = nullptr;
 // Export special symbol to identify modules as ReShade instances
 extern "C" __declspec(dllexport) const char *ReShadeVersion = VERSION_STRING_PRODUCT;
 
+HANDLE g_exit_event = nullptr;
 HMODULE g_module_handle = nullptr;
 std::filesystem::path g_reshade_dll_path;
 std::filesystem::path g_reshade_base_path;
@@ -131,8 +132,6 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
 			g_reshade_dll_path = get_module_path(hModule);
 			g_target_executable_path = get_module_path(nullptr);
 
-			ini_file &config = reshade::global_config();
-
 			const std::filesystem::path module_name = g_reshade_dll_path.stem();
 
 			const bool is_d3d = _wcsnicmp(module_name.c_str(), L"d3d", 3) == 0;
@@ -143,6 +142,10 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
 			// UWP apps do not have write access to the application directory, so never default the base path to it for them
 			const bool default_base_to_target_executable_path = !is_d3d && !is_dxgi && !is_opengl && !is_dinput && !is_uwp_app();
 
+			g_reshade_base_path = get_base_path(default_base_to_target_executable_path);
+
+			const ini_file &config = reshade::global_config();
+
 			// When ReShade is not loaded by proxy, only actually load when a configuration file exists for the target executable
 			// This e.g. prevents loading the implicit Vulkan layer when not explicitly enabled for an application
 			if (default_base_to_target_executable_path && !GetEnvironmentVariableW(L"RESHADE_DISABLE_LOADING_CHECK", nullptr, 0))
@@ -152,24 +155,24 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
 				{
 #ifndef NDEBUG
 					// Log was not yet opened at this point, so this only writes to debug output
-					LOG(WARN) << "ReShade was not enabled for " << g_target_executable_path << "! Aborting initialization ...";
+					reshade::log::message(reshade::log::level::warning, "ReShade was not enabled for '%s'! Aborting initialization ...", g_target_executable_path.u8string().c_str());
 #endif
 					return FALSE; // Make the 'LoadLibrary' call that loaded this instance fail
 				}
 			}
 
-			g_reshade_base_path = get_base_path(default_base_to_target_executable_path);
-
-			if (config.get("INSTALL", "EnableLogging") || !config.has("INSTALL", "EnableLogging"))
+			if (config.get("INSTALL", "Logging") || (!config.has("INSTALL", "Logging") && !GetEnvironmentVariableW(L"RESHADE_DISABLE_LOGGING", nullptr, 0)))
 			{
+				std::filesystem::path log_path = config.path();
+				log_path.replace_extension(L".log");
+
 				std::error_code ec;
-				std::filesystem::path log_path = g_reshade_base_path / L"ReShade.log";
 				if (!reshade::log::open_log_file(log_path, ec))
 				{
-					for (int log_index = 1; std::filesystem::exists(log_path, ec); ++log_index)
+					// Try a different file if the default failed to open (e.g. because currently in use by another ReShade instance)
+					for (int log_index = 0; log_index < 10 && std::filesystem::exists(log_path, ec); ++log_index)
 					{
-						// Try a different file if the default failed to open (e.g. because currently in use by another ReShade instance)
-						log_path.replace_filename(L"ReShade" + std::to_wstring(log_index + 1) + L".log");
+						log_path.replace_extension(L".log" + std::to_wstring(log_index + 1));
 
 						if (reshade::log::open_log_file(log_path, ec))
 							break;
@@ -177,18 +180,27 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
 
 #ifndef NDEBUG
 					if (ec)
-						LOG(ERROR) << "Opening the ReShade log file" << " failed with error code " << ec.value() << '.';
+						reshade::log::message(reshade::log::level::error, "Opening the ReShade log file failed with error code %d.", ec.value());
 #endif
 				}
 			}
 
-			LOG(INFO) << "Initializing crosire's ReShade version '" VERSION_STRING_FILE "' "
+			reshade::log::message(reshade::log::level::info,
+				"Initializing crosire's ReShade version '" VERSION_STRING_FILE "' "
 #ifndef _WIN64
 				"(32-bit) "
 #else
 				"(64-bit) "
 #endif
-				"loaded from " << g_reshade_dll_path << " into " << g_target_executable_path << " ...";
+				"loaded from '%s' into '%s' (0x%X) ...",
+				g_reshade_dll_path.u8string().c_str(),
+#ifndef NDEBUG
+				static_cast<const char *>(GetCommandLineA()),
+#else
+				// Do not log full command-line in release builds, since it may contain sensitive information like authentication tokens
+				g_target_executable_path.u8string().c_str(),
+#endif
+				static_cast<unsigned int>(std::hash<std::string>()(g_target_executable_path.stem().u8string()) & 0xFFFFFFFF));
 
 			// Check if another ReShade instance was already loaded into the process
 			if (HMODULE modules[1024]; K32EnumProcessModules(GetCurrentProcess(), modules, sizeof(modules), &fdwReason)) // Use kernel32 variant which is available in DllMain
@@ -197,7 +209,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
 				{
 					if (modules[i] != hModule && GetProcAddress(modules[i], "ReShadeVersion") != nullptr)
 					{
-						LOG(WARN) << "Another ReShade instance was already loaded from " << get_module_path(modules[i]) << "! Aborting initialization ...";
+						reshade::log::message(reshade::log::level::warning, "Another ReShade instance was already loaded from '%s'! Aborting initialization ...", get_module_path(modules[i]).u8string().c_str());
 						return FALSE; // Make the 'LoadLibrary' call that loaded this instance fail
 					}
 				}
@@ -246,7 +258,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
 						if (dbghelp_write_dump(GetCurrentProcess(), GetCurrentProcessId(), file, MiniDumpNormal, &info, nullptr, nullptr))
 							dump_index++;
 						else
-							LOG(ERROR) << "Failed to write minidump!";
+							reshade::log::message(reshade::log::level::error, "Failed to write minidump!");
 
 						CloseHandle(file);
 					}
@@ -264,70 +276,77 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
 
 			// Register modules to hook
 			{
-				reshade::hooks::register_module(L"user32.dll");
-
-#if RESHADE_ADDON_LITE
-				// Disable network hooks when requested through an environment variable and always disable add-ons in that case
-				if (GetEnvironmentVariableW(L"RESHADE_DISABLE_NETWORK_HOOK", nullptr, 0))
+				if (!GetEnvironmentVariableW(L"RESHADE_DISABLE_INPUT_HOOK", nullptr, 0))
 				{
-					extern volatile long g_network_traffic;
-					// Special value to indicate that add-ons should never be enabled
-					g_network_traffic = std::numeric_limits<long>::max();
-					reshade::addon_enabled = false;
+					g_exit_event = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+
+					reshade::hooks::register_module(L"user32.dll");
+
+					// Always register DirectInput 1-7 module (to overwrite cooperative level)
+					reshade::hooks::register_module(get_system_path() / L"dinput.dll");
+					// Register DirectInput 8 module in case it was used to load ReShade (but ignore otherwise)
+					if (_wcsicmp(module_name.c_str(), L"dinput8") == 0)
+						reshade::hooks::register_module(get_system_path() / L"dinput8.dll");
 				}
-				else
+
+#if RESHADE_ADDON == 1
+				if (!GetEnvironmentVariableW(L"RESHADE_DISABLE_NETWORK_HOOK", nullptr, 0))
 				{
 					reshade::hooks::register_module(L"ws2_32.dll");
 				}
+				else
+				{
+					// Disable network hooks when requested through an environment variable and always disable add-ons in that case
+					extern volatile long g_network_traffic;
+					g_network_traffic = std::numeric_limits<long>::max(); // Special value to indicate that add-ons should never be enabled
+					reshade::addon_enabled = false;
+				}
 #endif
 
-				// Only register D3D hooks when module is not called opengl32.dll
-				if (!is_opengl)
+				if (!GetEnvironmentVariableW(L"RESHADE_DISABLE_GRAPHICS_HOOK", nullptr, 0))
 				{
-					reshade::hooks::register_module(get_system_path() / L"d2d1.dll");
-					reshade::hooks::register_module(get_system_path() / L"d3d9.dll");
-					reshade::hooks::register_module(get_system_path() / L"d3d10.dll");
-					reshade::hooks::register_module(get_system_path() / L"d3d10_1.dll");
-					reshade::hooks::register_module(get_system_path() / L"d3d11.dll");
+					// Only register D3D hooks when module is not called opengl32.dll
+					if (!is_opengl)
+					{
+						reshade::hooks::register_module(get_system_path() / L"d2d1.dll");
+						reshade::hooks::register_module(get_system_path() / L"d3d9.dll");
+						reshade::hooks::register_module(get_system_path() / L"d3d10.dll");
+						reshade::hooks::register_module(get_system_path() / L"d3d10_1.dll");
+						reshade::hooks::register_module(get_system_path() / L"d3d11.dll");
 
-					// On Windows 7 the d3d12on7 module is not in the system path, so register to hook any d3d12.dll loaded instead
-					if (is_windows7() && _wcsicmp(module_name.c_str(), L"d3d12") != 0)
-						reshade::hooks::register_module(L"d3d12.dll");
-					else
-						reshade::hooks::register_module(get_system_path() / L"d3d12.dll");
+						// On Windows 7 the d3d12on7 module is not in the system path, so register to hook any d3d12.dll loaded instead
+						if (is_windows7() && _wcsicmp(module_name.c_str(), L"d3d12") != 0)
+							reshade::hooks::register_module(L"d3d12.dll");
+						else
+							reshade::hooks::register_module(get_system_path() / L"d3d12.dll");
 
-					reshade::hooks::register_module(get_system_path() / L"dxgi.dll");
-				}
+						reshade::hooks::register_module(get_system_path() / L"dxgi.dll");
+					}
 
-				// Only register OpenGL hooks when module is not called any D3D module name
-				if (!is_d3d && !is_dxgi)
-					reshade::hooks::register_module(get_system_path() / L"opengl32.dll");
+					// Only register OpenGL hooks when module is not called any D3D module name
+					if (!is_d3d && !is_dxgi)
+						reshade::hooks::register_module(get_system_path() / L"opengl32.dll");
 
-				// Do not register Vulkan hooks, since Vulkan layering mechanism is used instead
+					// Do not register Vulkan hooks, since Vulkan layering mechanism is used instead
 
 #ifndef _WIN64
-				reshade::hooks::register_module(L"vrclient.dll");
+					reshade::hooks::register_module(L"vrclient.dll");
 #else
-				reshade::hooks::register_module(L"vrclient_x64.dll");
+					reshade::hooks::register_module(L"vrclient_x64.dll");
 #endif
-
-				// Always register DirectInput 1-7 module (to overwrite cooperative level)
-				reshade::hooks::register_module(get_system_path() / L"dinput.dll");
-				// Register DirectInput 8 module in case it was used to load ReShade (but ignore otherwise)
-				if (_wcsicmp(module_name.c_str(), L"dinput8") == 0)
-					reshade::hooks::register_module(get_system_path() / L"dinput8.dll");
+				}
 			}
 
-			LOG(INFO) << "Initialized.";
+			reshade::log::message(reshade::log::level::info, "Initialized.");
 			break;
 		}
 		case DLL_PROCESS_DETACH:
 		{
-			LOG(INFO) << "Exiting ...";
+			reshade::log::message(reshade::log::level::info, "Exiting ...");
 
 #if RESHADE_ADDON
 			if (reshade::has_loaded_addons())
-				LOG(WARN) << "Add-ons are still loaded! Application may crash on exit.";
+				reshade::log::message(reshade::log::level::warning, "Add-ons are still loaded! Application may crash on exit.");
 #endif
 
 			reshade::hooks::uninstall();
@@ -336,17 +355,19 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
 			// This is necessary since a different thread may have called into the 'GetMessage' hook from ReShade, but may not receive a message until after the ReShade module was unloaded
 			// At that point it would return to code that was already unloaded and crash
 			// Hooks were already uninstalled now, so after returning from any existing 'GetMessage' hook call, application will call the real one next and things continue to work
-			g_module_handle = nullptr;
-			// This duration has to be slightly larger than the timeout in 'HookGetMessage' to ensure success
-			// It should also be large enough to cover any potential other calls to previous hooks that may still be in flight from other threads
-			Sleep(1000);
+			if (g_exit_event != nullptr)
+			{
+				SetEvent(g_exit_event);
+				Sleep(1000);
+				CloseHandle(g_exit_event);
+			}
 
 #ifndef NDEBUG
 			if (s_exception_handler_handle != nullptr)
 				RemoveVectoredExceptionHandler(s_exception_handler_handle);
 #endif
 
-			LOG(INFO) << "Finished exiting.";
+			reshade::log::message(reshade::log::level::info, "Finished exiting.");
 			break;
 		}
 	}
